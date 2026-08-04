@@ -60,6 +60,18 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    healthcheck:
+      # Passes once an RQ worker for this container is registered and beating
+      # in Redis, so a crashed or wedged worker gets restarted rather than
+      # silently holding the queue.
+      test: ["CMD", "python", "-m", "bandit_api.healthcheck", "worker"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # First boot downloads ~447 MB from Zenodo and converts it before the
+      # worker registers. Failures during start_period do not count toward
+      # retries, and a first success ends it early, so being generous is cheap.
+      start_period: 1800s
     deploy:
       resources:
         limits:
@@ -91,12 +103,21 @@ services:
     restart: unless-stopped
     command: >
       sh -c "while true; do
+               touch /tmp/reaper-alive;
                find /data/outputs -mindepth 1 -maxdepth 1 -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null;
                find /data/inbox -type f -mmin +1440 -delete 2>/dev/null;
                sleep 3600;
              done"
     volumes:
       - bandit-data:/data
+    healthcheck:
+      # The loop touches this file every pass; if the sweep stopped running the
+      # timestamp goes stale and the container is restarted.
+      test: ["CMD-SHELL", "find /tmp/reaper-alive -mmin -70 | grep -q ."]
+      interval: 300s
+      timeout: 10s
+      retries: 2
+      start_period: 60s
     deploy:
       resources:
         limits:

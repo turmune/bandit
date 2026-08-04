@@ -187,6 +187,22 @@ md5-verified.
 **Three services build the same image.** `api`, `worker` and `reaper` all use
 `build: .`; Docker's layer cache makes the second and third near-instant.
 
+**Every service has a healthcheck**, so nothing reports health `unknown`:
+
+| service | probe | start period |
+|---|---|---|
+| `api` | `GET /healthz` | 20 s |
+| `worker` | an RQ worker for *this container* is beating in Redis | 1800 s |
+| `redis` | `redis-cli ping` | — |
+| `reaper` | sweep loop touched its liveness file within 70 min | 60 s |
+
+The worker's long start period covers the first-boot Zenodo download; it shows
+`starting` until the model is loaded and the worker registers. Failures during a
+start period do not count toward retries and a first success ends it early, so
+the generous value costs nothing. The probe matches on hostname deliberately —
+otherwise one container's check could pass because a *different* worker is
+healthy.
+
 ### Environment
 
 | Variable | Default | Notes |

@@ -6,3 +6,4 @@ __pycache__/
 # Checkpoints (447 MB each) — fetch with scripts/fetch_weights.py
 models/
 data/
+.env

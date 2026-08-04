@@ -255,7 +255,7 @@ def separate_one(url: str, key: str, path: Path, args) -> bool:
 
     code, body = upload(url, key, path, {
         "quality": args.quality,
-        "stems": ",".join(args.stems) if args.stems else "",
+        "stems": args.stems or "",
         "output_format": args.format,
     })
     if code != 202:
@@ -334,8 +334,11 @@ def main() -> int:
     p.add_argument("-q", "--quality", default="balanced",
                    choices=["fast", "balanced", "best"],
                    help="higher quality costs proportionally more time (default: balanced)")
-    p.add_argument("-s", "--stems", nargs="*", choices=["speech", "music", "sfx"],
-                   help="subset to produce (default: all three)")
+    # Comma-separated rather than nargs="*": a greedy list argument swallows the
+    # following positional, so `-s speech clip.mp4` lost the filename.
+    p.add_argument("-s", "--stems", metavar="LIST",
+                   help="comma-separated subset, e.g. speech or speech,music "
+                        "(default: all three)")
     p.add_argument("-f", "--format", default="wav", choices=["wav", "flac"])
     p.add_argument("--url", help=f"API base URL (default: {DEFAULT_URL})")
     p.add_argument("--key", help="API key; normally read from .env")
@@ -343,6 +346,12 @@ def main() -> int:
     p.add_argument("--status", action="store_true", help="show server health and exit")
     p.add_argument("--jobs", action="store_true", help="list jobs from this machine")
     args = p.parse_args()
+
+    if args.stems:
+        bad = sorted(set(x.strip() for x in args.stems.split(",")) - {"speech", "music", "sfx"})
+        if bad:
+            print(red(f"unknown stem(s): {', '.join(bad)} — choose from speech, music, sfx"))
+            return 1
 
     url, key = resolve_config(args)
 

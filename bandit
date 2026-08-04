@@ -25,8 +25,11 @@ import argparse
 import http.client
 import json
 import os
+import shutil
 import ssl
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -41,6 +44,11 @@ STATE = ROOT / "data" / ".jobs.json"
 AUDIO_SUFFIXES = {
     ".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".aiff", ".aif",
     ".mp4", ".mkv", ".mov", ".webm", ".ts", ".m4v",
+}
+
+# Containers whose audio is worth stripping out before upload.
+VIDEO_SUFFIXES = {
+    ".mp4", ".mkv", ".mov", ".webm", ".ts", ".m4v", ".avi", ".flv", ".wmv",
 }
 
 DEFAULT_URL = "https://bandit.efobay.com"
@@ -130,6 +138,36 @@ def human(n: float) -> str:
             return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
         n /= 1024
     return f"{n:.1f}TB"
+
+
+def extract_audio(path: Path) -> Path | None:
+    """Copy the audio stream out of a video, without re-encoding.
+
+    Only the audio is ever separated, so uploading the video ships hundreds of
+    megabytes to accomplish nothing -- a 3-minute 1080p clip typically carries
+    about 3 MB of audio. ``-c:a copy`` avoids a re-encode, so this is near
+    instant and lossless. Matroska is the output container because it accepts
+    virtually any audio codec, which saves matching container to codec.
+
+    Returns None if ffmpeg is missing or the file has no audio stream; the
+    caller then uploads the original rather than failing.
+    """
+    if shutil.which("ffmpeg") is None:
+        return None
+
+    fd, tmp = tempfile.mkstemp(prefix="bandit-", suffix=".mka")
+    os.close(fd)
+    out = Path(tmp)
+
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-i", str(path), "-vn", "-c:a", "copy", str(out)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+        out.unlink(missing_ok=True)
+        return None
+    return out
 
 
 def upload(url: str, key: str, path: Path, fields: dict[str, str]) -> tuple[int, bytes]:
@@ -253,7 +291,28 @@ def cmd_jobs(url: str, key: str) -> int:
 def separate_one(url: str, key: str, path: Path, args) -> bool:
     print(f"\n{bold(path.name)}  {dim(human(path.stat().st_size))}")
 
-    code, body = upload(url, key, path, {
+    # Strip video before the upload, not after. Rejecting it server-side would
+    # not help: by then the slow upload has already happened.
+    source, scratch = path, None
+    if path.suffix.lower() in VIDEO_SUFFIXES:
+        extracted = extract_audio(path)
+        if extracted is None:
+            print(yellow("  could not extract audio locally; uploading whole file"))
+        else:
+            before, after = path.stat().st_size, extracted.stat().st_size
+            print(dim(f"  audio track extracted: {human(before)} -> {human(after)}"
+                      f"  ({before / max(after, 1):.0f}x less to upload)"))
+            source, scratch = extracted, extracted
+
+    try:
+        return _submit_and_collect(url, key, path, source, args)
+    finally:
+        if scratch is not None:
+            scratch.unlink(missing_ok=True)
+
+
+def _submit_and_collect(url: str, key: str, path: Path, source: Path, args) -> bool:
+    code, body = upload(url, key, source, {
         "quality": args.quality,
         "stems": args.stems or "",
         "output_format": args.format,

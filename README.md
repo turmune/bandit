@@ -259,6 +259,13 @@ Config resolves from `--url`/`--key`, then the environment, then `.env`. If the
 URL carries a `:8000` suffix (Coolify's container-port hint, easy to copy by
 mistake) the client strips it and says so, rather than hanging on a closed port.
 
+**Video is handled locally.** Drop in an mp4/mov/mkv and the client copies the
+audio stream out with ffmpeg before uploading — no re-encode, so it is near
+instant and lossless. A 3-minute 1080p clip goes from ~200 MB to ~3 MB on the
+wire. Rejecting video server-side would not help: by the time the API could
+refuse it, the slow upload has already happened. Falls back to uploading the
+original if ffmpeg is not installed.
+
 **Short clips look slow.** A 6 s file spends most of its time on the analysis
 padding around it, so it can measure 20×+ realtime where a 3-minute track
 measures ~7× at `fast`. Benchmark with something at least a minute long.

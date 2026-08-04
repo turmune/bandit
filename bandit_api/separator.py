@@ -23,6 +23,8 @@ from __future__ import annotations
 import logging
 import math
 import os
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
@@ -154,8 +156,58 @@ class Separator:
             fs=SAMPLE_RATE,
         ).to(self.device)
 
+    @staticmethod
+    def _decode_with_ffmpeg(path: Path) -> tuple[torch.Tensor, int]:
+        """Decode anything libsndfile cannot open, via the ffmpeg CLI.
+
+        torchaudio here only has the ``soundfile`` backend, which handles bare
+        audio containers and nothing else -- so mp4/mov/mkv/webm, i.e. every
+        video, fails to load. ffmpeg is already in the image for exactly this.
+
+        Resampling happens inside ffmpeg so the caller never pays for a second
+        pass, and ``-vn`` drops the video stream before it is ever decoded.
+        """
+        # Write beside the source (the data volume) rather than /tmp: a
+        # feature-length decode is ~1 GB of PCM and the container's /tmp lives
+        # on the overlay filesystem.
+        scratch_dir = path.parent if os.access(path.parent, os.W_OK) else None
+        fd, tmp_name = tempfile.mkstemp(suffix=".wav", dir=scratch_dir)
+        os.close(fd)
+        tmp = Path(tmp_name)
+
+        try:
+            proc = subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(path),
+                    "-vn",
+                    "-ar", str(SAMPLE_RATE),
+                    "-c:a", "pcm_s16le",
+                    str(tmp),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode != 0 or tmp.stat().st_size == 0:
+                raise RuntimeError(
+                    f"could not decode {path.name}: no audio stream, or an "
+                    f"unsupported format. ffmpeg said: "
+                    f"{proc.stderr.strip()[:300] or '(nothing)'}"
+                )
+            audio, fs = ta.load(str(tmp))
+            return audio, fs
+        finally:
+            tmp.unlink(missing_ok=True)
+
     def _load_audio(self, path: str | Path) -> tuple[torch.Tensor, int]:
-        audio, fs = ta.load(str(path))
+        path = Path(path)
+        try:
+            audio, fs = ta.load(str(path))
+        except Exception as exc:
+            log.info("soundfile could not open %s (%s); decoding via ffmpeg",
+                     path.name, type(exc).__name__)
+            audio, fs = self._decode_with_ffmpeg(path)
+
         if fs != SAMPLE_RATE:
             audio = ta.functional.resample(audio, fs, SAMPLE_RATE)
         return audio, fs

@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Client for a deployed BandIt v2 separation API.
+
+Drop audio into data/in/, run `./bandit`, collect stems from data/out/.
+
+Standard library only, on purpose: this is the *client*, and it should run from
+any checkout or any machine without installing torch or a virtualenv.
+
+    ./bandit                        separate everything in data/in/
+    ./bandit song.wav clip.mp4      separate specific files
+    ./bandit -q best song.wav       pick a quality preset
+    ./bandit -s speech song.wav     only the stems you want
+    ./bandit --status               server health and queue depth
+    ./bandit --jobs                 jobs submitted from this machine
+
+Configuration is read from --url/--key, then the environment, then .env:
+
+    BANDIT_URL=https://bandit.efobay.com
+    BANDIT_API_KEY=...
+"""
+
+from __future__ import annotations
+
+import argparse
+import http.client
+import json
+import os
+import ssl
+import sys
+import time
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+IN_DIR = ROOT / "data" / "in"
+OUT_DIR = ROOT / "data" / "out"
+STATE = ROOT / "data" / ".jobs.json"
+
+AUDIO_SUFFIXES = {
+    ".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".aiff", ".aif",
+    ".mp4", ".mkv", ".mov", ".webm", ".ts", ".m4v",
+}
+
+DEFAULT_URL = "https://bandit.efobay.com"
+
+# ANSI only when attached to a terminal, so piping to a file stays clean.
+_TTY = sys.stdout.isatty()
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _TTY else text
+
+def bold(t): return _c("1", t)
+def dim(t): return _c("2", t)
+def green(t): return _c("32", t)
+def red(t): return _c("31", t)
+def yellow(t): return _c("33", t)
+
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+def load_dotenv(path: Path) -> dict[str, str]:
+    """Minimal .env reader. Avoids a python-dotenv dependency for six lines."""
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def resolve_config(args) -> tuple[str, str]:
+    env_file = load_dotenv(ROOT / ".env")
+
+    url = args.url or os.environ.get("BANDIT_URL") or env_file.get("BANDIT_URL") or DEFAULT_URL
+    key = args.key or os.environ.get("BANDIT_API_KEY") or env_file.get("BANDIT_API_KEY", "")
+
+    # A bare key in .env (no KEY=) is a common slip; treat a single opaque line
+    # as the API key rather than failing with a confusing 401 later.
+    if not key and (ROOT / ".env").exists():
+        lines = [l.strip() for l in (ROOT / ".env").read_text().splitlines() if l.strip()]
+        if len(lines) == 1 and "=" not in lines[0]:
+            key = lines[0]
+
+    url = url.rstrip("/")
+    # Coolify's domain field takes a :8000 suffix to pick the container port;
+    # that port is not part of the public URL and would fail to connect here.
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == "https" and parsed.port == 8000:
+        url = f"https://{parsed.hostname}"
+        print(dim(f"note: stripped :8000 from the URL (that is Coolify's internal "
+                  f"port hint, not public) -> {url}"))
+    if not key:
+        sys.exit(red("No API key. Put BANDIT_API_KEY=... in .env or pass --key."))
+    return url, key
+
+
+# ---------------------------------------------------------------------------
+# http
+# ---------------------------------------------------------------------------
+
+def _connect(url: str):
+    p = urllib.parse.urlparse(url)
+    host, port = p.hostname, p.port
+    if p.scheme == "https":
+        return http.client.HTTPSConnection(host, port, context=ssl.create_default_context(),
+                                           timeout=120), p.path
+    return http.client.HTTPConnection(host, port, timeout=120), p.path
+
+
+def api_get(url: str, key: str, path: str) -> tuple[int, bytes]:
+    conn, base = _connect(url)
+    try:
+        conn.request("GET", base + path, headers={"Authorization": f"Bearer {key}"})
+        r = conn.getresponse()
+        return r.status, r.read()
+    finally:
+        conn.close()
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def upload(url: str, key: str, path: Path, fields: dict[str, str]) -> tuple[int, bytes]:
+    """POST a multipart upload, streaming the file from disk.
+
+    Built by hand rather than buffering into urllib because these files run to
+    hundreds of MB and reading one into memory to send it is wasteful --
+    and it lets us show upload progress.
+    """
+    boundary = uuid.uuid4().hex
+    pre = "".join(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'
+        for k, v in fields.items() if v
+    )
+    pre += (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{path.name}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    )
+    pre_b, post_b = pre.encode(), f"\r\n--{boundary}--\r\n".encode()
+    size = path.stat().st_size
+
+    conn, base = _connect(url)
+    try:
+        conn.putrequest("POST", base + "/v1/jobs")
+        conn.putheader("Authorization", f"Bearer {key}")
+        conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+        conn.putheader("Content-Length", str(len(pre_b) + size + len(post_b)))
+        conn.endheaders()
+
+        conn.send(pre_b)
+        sent = 0
+        t0 = time.time()
+        with path.open("rb") as fh:
+            while chunk := fh.read(1 << 20):
+                conn.send(chunk)
+                sent += len(chunk)
+                if _TTY and size:
+                    rate = sent / max(1e-6, time.time() - t0)
+                    print(f"\r  uploading {human(sent)}/{human(size)} "
+                          f"({100 * sent / size:.0f}%) at {human(rate)}/s   ",
+                          end="", flush=True)
+        conn.send(post_b)
+        if _TTY and size:
+            print("\r" + " " * 70 + "\r", end="")
+
+        r = conn.getresponse()
+        return r.status, r.read()
+    finally:
+        conn.close()
+
+
+def download(url: str, key: str, job_id: str, stem: str, dest: Path) -> int:
+    req = urllib.request.Request(
+        f"{url}/v1/jobs/{job_id}/stems/{stem}",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    with urllib.request.urlopen(req, timeout=300) as r, dest.open("wb") as out:
+        while chunk := r.read(1 << 20):
+            out.write(chunk)
+            total += len(chunk)
+    return total
+
+
+# ---------------------------------------------------------------------------
+# local job log
+# ---------------------------------------------------------------------------
+
+def remember(job_id: str, source: str) -> None:
+    jobs = json.loads(STATE.read_text()) if STATE.exists() else []
+    jobs.append({"job_id": job_id, "source": source, "at": time.time()})
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(jobs[-200:], indent=2))
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+def cmd_status(url: str, key: str) -> int:
+    try:
+        code, body = api_get(url, key, "/readyz")
+    except Exception as exc:
+        print(red(f"cannot reach {url}: {exc}"))
+        return 1
+    try:
+        d = json.loads(body)
+    except ValueError:
+        print(red(f"unexpected reply from {url} ({code}): {body[:200]!r}"))
+        return 1
+
+    ok = d.get("status") == "ok"
+    workers, queued = d.get("workers", "?"), d.get("queued_jobs", "?")
+    print(f"{bold(url)}  {green('ready') if ok else yellow(d.get('status', '?'))}"
+          f"  {dim(f'{workers} worker(s), {queued} queued')}")
+    if not ok:
+        print(dim("  no worker registered — on first boot it downloads ~447MB"))
+    return 0 if ok else 1
+
+
+def cmd_jobs(url: str, key: str) -> int:
+    if not STATE.exists():
+        print(dim("no jobs submitted from this machine yet"))
+        return 0
+    for j in json.loads(STATE.read_text())[-20:]:
+        code, body = api_get(url, key, f"/v1/jobs/{j['job_id']}")
+        if code == 404:
+            state = dim("expired")
+        else:
+            d = json.loads(body)
+            s = d["status"]
+            colour = {"succeeded": green, "failed": red}.get(s, yellow)
+            state = colour(s) + (f" {d['progress']:.0%}" if s == "running" else "")
+        print(f"  {j['job_id'][:8]}  {j['source'][:40]:<40}  {state}")
+    return 0
+
+
+def separate_one(url: str, key: str, path: Path, args) -> bool:
+    print(f"\n{bold(path.name)}  {dim(human(path.stat().st_size))}")
+
+    code, body = upload(url, key, path, {
+        "quality": args.quality,
+        "stems": ",".join(args.stems) if args.stems else "",
+        "output_format": args.format,
+    })
+    if code != 202:
+        print(red(f"  submit failed ({code}): {body[:300].decode(errors='replace')}"))
+        return False
+
+    job = json.loads(body)
+    job_id = job["job_id"]
+    remember(job_id, path.name)
+    print(f"  job {dim(job_id[:8])} queued")
+
+    t0 = time.time()
+    last = ""
+    prev_prog = -1.0
+    eta_secs: float | None = None
+    eta_at = 0.0
+
+    while True:
+        code, body = api_get(url, key, f"/v1/jobs/{job_id}")
+        if code != 200:
+            print(red(f"\n  lost the job ({code})"))
+            return False
+        d = json.loads(body)
+        status, prog = d["status"], d["progress"]
+        now = time.time()
+
+        if status == "running":
+            # Server progress advances per inference batch, so it is a step
+            # function. Recomputing elapsed/prog every poll makes the estimate
+            # *climb* between steps, which reads as "getting slower". Instead
+            # re-estimate only when progress actually moves, then count that
+            # estimate down.
+            if prog > prev_prog:
+                if prog > 0.02:
+                    elapsed = now - t0
+                    eta_secs, eta_at = elapsed / prog - elapsed, now
+                prev_prog = prog
+            eta = ""
+            if eta_secs is not None:
+                left = max(0.0, eta_secs - (now - eta_at))
+                eta = f" · ~{left / 60:.0f}m left" if left >= 60 else " · almost there"
+            line = f"  separating {prog:.0%}{eta} · {(now - t0) / 60:.1f}m elapsed"
+        elif status == "queued":
+            line = f"  waiting in queue (position {d.get('queue_position') or '?'})"
+        else:
+            line = ""
+
+        if line and line != last:
+            print(f"\r{line}   ", end="" if _TTY else "\n", flush=True)
+            last = line
+
+        if status == "succeeded":
+            break
+        if status == "failed":
+            print(red(f"\n  failed: {d.get('error')}"))
+            return False
+        time.sleep(args.poll)
+
+    dest = OUT_DIR / path.stem
+    print(f"\r  {green('done')} in {(time.time() - t0) / 60:.1f}m -> {dest}/      ")
+    for stem in d["stems"]:
+        f = dest / f"{stem}.{d['output_format']}"
+        n = download(url, key, job_id, stem, f)
+        print(f"    {stem:<7} {human(n)}")
+    return True
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="bandit",
+        description="Separate audio into speech/music/sfx via a deployed BandIt v2 API.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"With no FILES, everything in {IN_DIR.relative_to(ROOT)}/ is processed.",
+    )
+    p.add_argument("files", nargs="*", type=Path, metavar="FILES")
+    p.add_argument("-q", "--quality", default="balanced",
+                   choices=["fast", "balanced", "best"],
+                   help="higher quality costs proportionally more time (default: balanced)")
+    p.add_argument("-s", "--stems", nargs="*", choices=["speech", "music", "sfx"],
+                   help="subset to produce (default: all three)")
+    p.add_argument("-f", "--format", default="wav", choices=["wav", "flac"])
+    p.add_argument("--url", help=f"API base URL (default: {DEFAULT_URL})")
+    p.add_argument("--key", help="API key; normally read from .env")
+    p.add_argument("--poll", type=float, default=5.0, metavar="SEC")
+    p.add_argument("--status", action="store_true", help="show server health and exit")
+    p.add_argument("--jobs", action="store_true", help="list jobs from this machine")
+    args = p.parse_args()
+
+    url, key = resolve_config(args)
+
+    if args.status:
+        return cmd_status(url, key)
+    if args.jobs:
+        return cmd_jobs(url, key)
+
+    if args.files:
+        files = [f for f in args.files]
+        missing = [f for f in files if not f.is_file()]
+        if missing:
+            print(red(f"not found: {', '.join(str(m) for m in missing)}"))
+            return 1
+    else:
+        IN_DIR.mkdir(parents=True, exist_ok=True)
+        files = sorted(f for f in IN_DIR.iterdir()
+                       if f.is_file() and f.suffix.lower() in AUDIO_SUFFIXES)
+        if not files:
+            print(f"Nothing to do. Drop audio into {bold(str(IN_DIR))} and run again.")
+            print(dim(f"  recognised: {' '.join(sorted(AUDIO_SUFFIXES))}"))
+            return 0
+
+    if cmd_status(url, key) != 0:
+        print(yellow("  jobs will queue until a worker appears"))
+    print(dim(f"  quality={args.quality}  {len(files)} file(s)"))
+
+    ok = sum(separate_one(url, key, f, args) for f in files)
+    print(f"\n{ok}/{len(files)} succeeded -> {bold(str(OUT_DIR))}")
+    return 0 if ok == len(files) else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # The job keeps running server-side; ./bandit --jobs picks it back up.
+        print(dim("\ninterrupted (the job continues on the server; see ./bandit --jobs)"))
+        sys.exit(130)

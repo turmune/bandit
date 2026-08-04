@@ -217,6 +217,52 @@ healthy.
 | `BANDIT_RESULT_TTL_SECONDS` | `86400` | job records and artifacts expire together |
 | `BANDIT_MAX_UPLOAD_BYTES` | `2147483648` | |
 
+## Client (`./bandit`)
+
+A standard-library-only CLI — no virtualenv, no torch, runs from any checkout.
+
+```bash
+cp .env.example .env      # then paste your BANDIT_API_KEY
+
+cp ~/Music/song.wav data/in/
+./bandit                  # separates everything in data/in -> data/out/<name>/
+```
+
+```
+$ ./bandit
+https://bandit.efobay.com  ready  1 worker(s), 0 queued
+  quality=balanced  1 file(s)
+
+song.wav  38.2MB
+  job a1b2c3d4 queued
+  separating 47% · ~12m left · 10.6m elapsed
+  done in 22.4m -> data/out/song/
+    music   34.1MB
+    sfx     34.1MB
+    speech  34.1MB
+```
+
+| command | |
+|---|---|
+| `./bandit` | separate everything in `data/in/` |
+| `./bandit a.wav b.mp4` | separate specific files |
+| `./bandit -q fast a.wav` | `fast` \| `balanced` \| `best` |
+| `./bandit -s speech a.wav` | only the stems you want |
+| `./bandit -f flac a.wav` | FLAC instead of WAV |
+| `./bandit --status` | server health and queue depth |
+| `./bandit --jobs` | jobs submitted from this machine |
+
+Ctrl-C is safe — the job keeps running server-side, and `./bandit --jobs` picks
+it back up.
+
+Config resolves from `--url`/`--key`, then the environment, then `.env`. If the
+URL carries a `:8000` suffix (Coolify's container-port hint, easy to copy by
+mistake) the client strips it and says so, rather than hanging on a closed port.
+
+**Short clips look slow.** A 6 s file spends most of its time on the analysis
+padding around it, so it can measure 20×+ realtime where a 3-minute track
+measures ~7× at `fast`. Benchmark with something at least a minute long.
+
 ## API
 
 ### `POST /v1/jobs`

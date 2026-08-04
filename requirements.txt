@@ -1,0 +1,23 @@
+# Install torch/torchaudio from the CPU index:
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+#
+# The upstream bandit-v2 requirements.in is NOT usable: it pins torch==2.0.0+cu118
+# and depends on Netflix-internal packages (nflx-manta, nflx_metaflow, jasper)
+# that are not published to PyPI. Only the inference subset is vendored here,
+# so this is the complete dependency set.
+
+torch==2.5.1
+torchaudio==2.5.1
+numpy>=1.24,<2.0
+soundfile>=0.12.1
+
+# API
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.12
+pydantic>=2.9
+pydantic-settings>=2.6
+
+# Queue
+redis>=5.2
+rq>=2.0

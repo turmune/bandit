@@ -1,0 +1,107 @@
+# Coolify: add as a "Docker Compose" resource pointing at this repo.
+# Expose ONLY the `api` service to a domain; worker and redis stay internal.
+#
+# Sized for an 8 vCPU / 16 GB host.
+
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    # Coolify routes the domain to this container port. No `ports:` mapping --
+    # that would bypass the proxy and publish straight on the host.
+    expose:
+      - "8000"
+    environment:
+      BANDIT_REDIS_URL: redis://redis:6379/0
+      BANDIT_DATA_DIR: /data
+      BANDIT_MAX_UPLOAD_BYTES: "2147483648"
+      BANDIT_DEFAULT_QUALITY: balanced
+      # Set in Coolify's Environment Variables tab. Without it every /v1 route
+      # is open to the internet, and one POST can occupy the box for hours.
+      BANDIT_API_KEY: ${BANDIT_API_KEY:?set BANDIT_API_KEY in Coolify}
+    volumes:
+      - bandit-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.5"
+
+  worker:
+    build: .
+    restart: unless-stopped
+    # Fetch weights on first boot, then serve the queue. Idempotent: the script
+    # verifies md5 and no-ops when the checkpoint is already present.
+    command: >
+      sh -c "python scripts/fetch_weights.py --variant multi --dest /data/models --convert
+             && python -m bandit_api.worker"
+    environment:
+      BANDIT_REDIS_URL: redis://redis:6379/0
+      BANDIT_DATA_DIR: /data
+      BANDIT_CKPT_PATH: /data/models/checkpoint-multi-inference.pt
+      # Leave ~2 cores for api + redis + OS. Oversubscribing torch threads
+      # slows this workload down; it does not speed it up.
+      BANDIT_THREADS: "6"
+      BANDIT_BATCH_SIZE: "4"
+      BANDIT_SEGMENT_SECONDS: "120"
+      OMP_NUM_THREADS: "6"
+      MKL_NUM_THREADS: "6"
+    volumes:
+      - bandit-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 10G
+          cpus: "6.5"
+    # One worker. Two would halve each other's cores and double peak RAM on a
+    # box that has neither to spare. Scale by adding hosts, not replicas.
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 60 1 --appendonly no --maxmemory 256mb --maxmemory-policy noeviction
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
+  # Deletes artifacts past their TTL. Three stereo stems per job run to
+  # ~100 MB; without this the volume fills in days.
+  reaper:
+    build: .
+    restart: unless-stopped
+    command: >
+      sh -c "while true; do
+               find /data/outputs -mindepth 1 -maxdepth 1 -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null;
+               find /data/inbox -type f -mmin +1440 -delete 2>/dev/null;
+               sleep 3600;
+             done"
+    volumes:
+      - bandit-data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+volumes:
+  bandit-data:
+  redis-data:

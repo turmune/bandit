@@ -1,0 +1,11 @@
+# Weights live on the volume, never in the image (447 MB per variant).
+models/
+data/
+.venv/
+tests/
+__pycache__/
+**/__pycache__/
+*.pyc
+.git/
+.pytest_cache/
+README.md

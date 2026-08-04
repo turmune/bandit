@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Checkpoints (447 MB each) — fetch with scripts/fetch_weights.py
+models/
+data/

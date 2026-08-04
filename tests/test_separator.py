@@ -1,0 +1,178 @@
+"""Correctness tests for the CPU separation wrapper.
+
+The load/validation tests are cheap. The two marked ``slow`` run real inference
+and take minutes on CPU -- run them with ``-m slow`` when touching the
+segmentation or chunking logic.
+
+    pytest tests/ -v                # fast only
+    pytest tests/ -v -m slow        # includes real inference
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import numpy as np
+import pytest
+import soundfile as sf
+
+from bandit_api.model import SAMPLE_RATE, STEMS, _strip_state_dict, build_bandit
+from bandit_api.separator import QUALITY_PRESETS, SeparationConfig, Separator
+
+CKPT = Path("models/checkpoint-multi.ckpt")
+requires_ckpt = pytest.mark.skipif(
+    not CKPT.exists(), reason="checkpoint absent; run scripts/fetch_weights.py"
+)
+
+
+@pytest.fixture(scope="session")
+def mixture(tmp_path_factory) -> Path:
+    """A short synthetic stereo mixture. Content is irrelevant to these tests."""
+    path = tmp_path_factory.mktemp("audio") / "mix.wav"
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", f"sine=frequency=220:duration=14:sample_rate={SAMPLE_RATE}",
+            "-f", "lavfi", "-i", f"anoisesrc=duration=14:color=pink:amplitude=0.3:sample_rate={SAMPLE_RATE}",
+            "-filter_complex",
+            "[0]tremolo=f=5:d=0.8[a];[a][1]amix=inputs=2:duration=shortest,"
+            "volume=2.0,pan=stereo|c0=c0|c1=c0[out]",
+            "-map", "[out]", "-ac", "2", "-ar", str(SAMPLE_RATE), str(path),
+        ],
+        check=True,
+    )
+    return path
+
+
+@pytest.fixture(scope="session")
+def separator() -> Separator:
+    if not CKPT.exists():
+        pytest.skip("checkpoint absent; run scripts/fetch_weights.py")
+    return Separator(CKPT, n_threads=6)
+
+
+def test_quality_presets_map_to_hop_sizes():
+    for name, hop in QUALITY_PRESETS.items():
+        assert SeparationConfig(quality=name).hop_size_seconds == hop
+
+
+def test_unknown_quality_is_rejected():
+    with pytest.raises(ValueError, match="unknown quality"):
+        _ = SeparationConfig(quality="ultra").hop_size_seconds
+
+
+def test_margin_shorter_than_chunk_is_rejected():
+    """Guards the invariant that keeps segment boundaries seamless."""
+    with pytest.raises(ValueError, match="margin_seconds"):
+        SeparationConfig(chunk_size_seconds=8.0, margin_seconds=4.0)
+
+
+def test_segment_off_the_hop_grid_is_rejected():
+    """5s segments against a 4s hop shift every chunk; measured 8 dB SNR."""
+    with pytest.raises(ValueError, match="integer multiple"):
+        SeparationConfig(quality="fast", segment_seconds=5.0, margin_seconds=8.0)
+
+
+def test_default_config_is_grid_aligned_for_every_preset():
+    for quality in QUALITY_PRESETS:
+        cfg = SeparationConfig(quality=quality)  # must not raise
+        assert cfg.segment_seconds % cfg.hop_size_seconds == 0
+        assert cfg.margin_seconds >= cfg.chunk_size_seconds
+
+
+def test_architecture_matches_published_stems():
+    model = build_bandit()
+    assert model.stems == STEMS
+    assert set(model.mask_estim) == set(STEMS)
+
+
+def test_strip_state_dict_is_idempotent():
+    """Converted checkpoints must reload.
+
+    ``scripts/fetch_weights.py --convert`` writes an already-stripped
+    state_dict, and the compose file points the worker at that file. If
+    stripping is not idempotent the second pass filters every key out and the
+    worker boots on random weights (or, with strict checks, not at all).
+    """
+    import torch
+
+    lightning_style = {
+        "state_dict": {
+            "model.band_split.weight": torch.zeros(2, 2),
+            "model.freq_weights": torch.zeros(2, dtype=torch.float64),
+            "loss_handler.l1snr/audio/speech_weight": torch.zeros(1),
+        }
+    }
+
+    once = _strip_state_dict(lightning_style)
+    assert set(once) == {"band_split.weight", "freq_weights"}
+    assert once["freq_weights"].dtype == torch.float32  # float64 downcast
+
+    twice = _strip_state_dict(once)
+    assert set(twice) == set(once)
+    assert all(torch.equal(twice[k], once[k]) for k in once)
+
+
+@requires_ckpt
+def test_rejects_unknown_stem(separator, mixture, tmp_path):
+    with pytest.raises(ValueError, match="unknown stems"):
+        separator.separate_file(mixture, tmp_path, stems=["vocals"])
+
+
+@pytest.mark.slow
+@requires_ckpt
+def test_segmentation_is_transparent(separator, mixture, tmp_path):
+    """Segment size must not change the output.
+
+    The outer segmentation loop is our code, not upstream's. If the margin
+    bookkeeping is wrong the audio still sounds plausible -- it just has
+    discontinuities every segment boundary. Separating the same input as one
+    segment and as three must agree to near bit-exactness.
+    """
+    cfg_single = SeparationConfig(
+        quality="fast", inference_batch_size=2, segment_seconds=600.0
+    )
+    # 4s segments over 14s of audio forces three boundaries. Both 4.0 and 8.0
+    # are multiples of the 4.0s `fast` hop, so the chunk grid stays aligned.
+    cfg_split = SeparationConfig(
+        quality="fast", inference_batch_size=2, segment_seconds=4.0, margin_seconds=8.0
+    )
+
+    one = separator.separate_file(mixture, tmp_path / "one", cfg=cfg_single)
+    many = separator.separate_file(mixture, tmp_path / "many", cfg=cfg_split)
+
+    for stem in STEMS:
+        a, _ = sf.read(str(one[stem]), dtype="float32")
+        b, _ = sf.read(str(many[stem]), dtype="float32")
+        assert a.shape == b.shape, f"{stem}: length changed with segment size"
+
+        noise = a - b
+        denom = float(np.mean(noise**2))
+        if denom == 0:
+            continue
+        snr = 10 * np.log10(float(np.mean(a**2)) / denom)
+        assert snr > 45, f"{stem}: segmentation altered output (SNR {snr:.1f} dB)"
+
+
+@pytest.mark.slow
+@requires_ckpt
+def test_stems_reconstruct_the_mixture(separator, mixture, tmp_path):
+    """The three stems should sum back to the input.
+
+    BandIt masks the complex STFT, so a correctly wired model reconstructs the
+    mixture closely. A low SNR here means the weights or the iSTFT path are
+    wrong -- the failure mode that ``strict=False`` loading hides.
+    """
+    cfg = SeparationConfig(quality="fast", inference_batch_size=2)
+    paths = separator.separate_file(mixture, tmp_path / "out", cfg=cfg)
+
+    mix, _ = sf.read(str(mixture), dtype="float32")
+    stems = {s: sf.read(str(p), dtype="float32")[0] for s, p in paths.items()}
+    n = min(len(mix), *(len(v) for v in stems.values()))
+
+    residual = mix[:n] - sum(v[:n] for v in stems.values())
+    snr = 10 * np.log10(
+        float(np.mean(mix[:n] ** 2)) / float(np.mean(residual**2))
+    )
+    assert snr > 25, f"stems do not reconstruct the mixture (SNR {snr:.1f} dB)"

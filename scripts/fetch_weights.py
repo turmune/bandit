@@ -79,6 +79,28 @@ def download(variant: str, dest: Path) -> Path:
     return target
 
 
+def converted_path(dest: Path, variant: str) -> Path:
+    return dest / f"checkpoint-{variant}-inference.pt"
+
+
+def is_usable(path: Path) -> bool:
+    """Cheap integrity check on an already-converted checkpoint.
+
+    Guards against a half-written file from a container killed mid-convert,
+    which would otherwise be trusted forever and boot the worker on garbage.
+    """
+    if not path.exists() or path.stat().st_size < 100 * 1024 * 1024:
+        return False
+    try:
+        import torch
+
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        return len(state) > 2000  # the real checkpoint carries 2946 tensors
+    except Exception as exc:
+        print(f"{path.name}: unreadable ({exc}); will re-fetch")
+        return False
+
+
 def convert(src: Path) -> Path:
     """Strip Lightning scaffolding down to a bare inference state_dict."""
     import torch
@@ -104,6 +126,15 @@ def main() -> int:
     ap.add_argument("--keep-original", action="store_true",
                     help="keep the Lightning .ckpt after converting")
     args = ap.parse_args()
+
+    # Must be idempotent: this runs on every worker start, and --convert deletes
+    # the source .ckpt. Checking only for the .ckpt would therefore re-download
+    # 447 MB from Zenodo on every single restart.
+    if args.convert:
+        target = converted_path(args.dest, args.variant)
+        if is_usable(target):
+            print(f"{target.name}: already present and usable, skipping fetch")
+            return 0
 
     ckpt = download(args.variant, args.dest)
     if args.convert:

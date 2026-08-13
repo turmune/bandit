@@ -182,31 +182,39 @@ def test_stems_reconstruct_the_mixture(separator, mixture, tmp_path):
 # Job-state regressions (no inference; these are pure logic)
 # ---------------------------------------------------------------------------
 
-def test_is_stale_only_fires_for_silent_running_jobs():
-    """Exercises the predicate itself, which all three call sites now share.
+def test_settle_if_stale_spares_healthy_and_terminal_jobs():
+    """Only a RUNNING job that has gone quiet gets abandoned.
 
-    Previously this asserted arithmetic on values it had just assigned, so no
-    change to jobs.py could have failed it.
+    Both of these paths return before touching Redis, so they are unit
+    testable; the abandon path itself is exercised end to end against a live
+    stack. The threshold is passed in rather than read from global config,
+    which is what makes this a policy test rather than a restatement of the
+    implementation.
     """
     import time as _t
 
-    from bandit_api.config import settings
-    from bandit_api.jobs import Job, JobStatus
-
-    long_ago = _t.time() - settings.stale_job_seconds - 1
+    from bandit_api.jobs import Job, JobStatus, settle_if_stale
 
     fresh = Job(id="a", status=JobStatus.RUNNING)
-    assert not fresh.is_stale, "a job written just now is not stale"
+    assert settle_if_stale(fresh, after=60).status is JobStatus.RUNNING
 
-    dead = Job(id="b", status=JobStatus.RUNNING)
-    dead.updated_at = long_ago
-    assert dead.is_stale
+    # Terminal and queued jobs are silent by nature and must never be resettled,
+    # however long ago they were written.
+    for status in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.QUEUED):
+        job = Job(id="b", status=status)
+        job.updated_at = _t.time() - 10_000
+        assert settle_if_stale(job, after=1).status is status
 
-    # Terminal jobs are silent forever by definition and must never be resettled.
-    for terminal in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.QUEUED):
-        j = Job(id="c", status=terminal)
-        j.updated_at = long_ago
-        assert not j.is_stale, f"{terminal.value} must not be treated as stale"
+
+def test_silent_for_measures_time_since_last_write():
+    import time as _t
+
+    from bandit_api.jobs import Job
+
+    job = Job(id="a")
+    assert job.silent_for < 1
+    job.updated_at = _t.time() - 300
+    assert 299 < job.silent_for < 301
 
 
 def test_terminal_jobs_get_the_result_ttl_others_get_longer():

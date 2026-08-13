@@ -29,8 +29,8 @@ from .jobs import (
     job_dir,
     load_job,
     save_job,
+    live_workers,
     settle_if_stale,
-    worker_is_live,
 )
 from .model import STEMS
 
@@ -45,6 +45,11 @@ app = FastAPI(
         "asynchronous: POST returns a job id, then poll or supply a callback_url."
     ),
 )
+
+# Handlers that touch Redis or the filesystem are sync `def`: the redis client
+# and shutil are blocking, and FastAPI runs sync handlers in a threadpool rather
+# than on the event loop. Only handlers that genuinely await (multipart upload)
+# are `async def`.
 
 VALID_QUALITY = ("fast", "balanced", "best")
 VALID_FORMATS = ("wav", "flac")
@@ -185,7 +190,7 @@ async def create_job(
 
 @app.post("/v1/jobs/from-url", response_model=JobResponse, status_code=202,
           dependencies=protected)
-async def create_job_from_url(req: UrlJobRequest) -> JobResponse:
+def create_job_from_url(req: UrlJobRequest) -> JobResponse:
     """Submit by URL. The worker fetches it, so large sources do not tie up the API."""
     chosen = _validate(req.quality, req.output_format, req.stems)
     job = Job(
@@ -212,13 +217,15 @@ def get_job(job_id: str) -> JobResponse:
     job = settle_if_stale(job)
     position = None
     if job.status is JobStatus.QUEUED:
-        ids = get_queue().get_job_ids()
-        position = ids.index(job_id) + 1 if job_id in ids else None
+        # LPOS computes this server-side; get_job_ids() would ship the entire
+        # queue on every poll of a job that may sit there for hours.
+        found = get_redis().lpos(get_queue().key, job_id)
+        position = found + 1 if found is not None else None
     return JobResponse.of(job, queue_position=position)
 
 
 @app.get("/v1/jobs/{job_id}/stems/{stem}", dependencies=protected)
-async def get_stem(job_id: str, stem: str) -> FileResponse:
+def get_stem(job_id: str, stem: str) -> FileResponse:
     job = load_job(job_id)
     if job is None:
         raise HTTPException(404, "job not found or expired")
@@ -237,7 +244,7 @@ async def get_stem(job_id: str, stem: str) -> FileResponse:
 
 
 @app.delete("/v1/jobs/{job_id}", status_code=204, dependencies=protected)
-async def remove_job(job_id: str) -> None:
+def remove_job(job_id: str) -> None:
     if not delete_job(job_id):
         raise HTTPException(404, "job not found or expired")
 
@@ -250,21 +257,17 @@ async def healthz() -> dict:
 
 @app.get("/readyz")
 def readyz() -> JSONResponse:
-    """Readiness: Redis reachable and a worker process actually alive.
-
-    Sync `def` on purpose -- FastAPI runs it in the threadpool, so the blocking
-    redis client cannot stall the event loop for every other request.
-    """
+    """Readiness: Redis reachable and at least one worker alive."""
     try:
-        get_redis().ping()
+        workers = live_workers()
+        queued = len(get_queue())
     except Exception as exc:
         return JSONResponse({"status": "unavailable", "redis": str(exc)}, 503)
 
-    live = worker_is_live()
     body = {
-        "status": "ok" if live else "degraded",
+        "status": "ok" if workers else "degraded",
         "queue": QUEUE_NAME,
-        "queued_jobs": len(get_queue()),
-        "workers": 1 if live else 0,
+        "queued_jobs": queued,
+        "workers": len(workers),
     }
-    return JSONResponse(body, 200 if live else 503)
+    return JSONResponse(body, 200 if workers else 503)

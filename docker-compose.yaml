@@ -94,12 +94,19 @@ services:
         limits:
           memory: 384M
 
-  # Deletes artifacts past their TTL. Three stereo stems per job run to
-  # ~100 MB; without this the volume fills in days.
+  # Expires artifacts past their TTL, and settles jobs whose worker died and
+  # that nobody is polling. Reads the retention window from the same Settings
+  # the API does.
   reaper:
     build: .
     restart: unless-stopped
-    command: ["sh", "scripts/reaper.sh"]
+    command: ["python", "-m", "bandit_api.reaper"]
+    environment:
+      BANDIT_REDIS_URL: redis://redis:6379/0
+      BANDIT_DATA_DIR: /data
+    depends_on:
+      redis:
+        condition: service_healthy
     volumes:
       - bandit-data:/data
     healthcheck:

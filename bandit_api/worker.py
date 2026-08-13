@@ -14,13 +14,16 @@ Run with:  python -m bandit_api.worker
 from __future__ import annotations
 
 import logging
+import os
+import socket
 import sys
 
-from rq import Queue, SimpleWorker, Worker
+from rq import SimpleWorker, Worker
 
 from .config import settings
 from .jobs import (
     QUEUE_NAME,
+    get_queue,
     get_redis,
     get_separator,
     reconcile_orphaned_jobs,
@@ -40,8 +43,10 @@ def main() -> int:
     # precede the checkpoint check and the model load: a worker crash-looping on
     # a bad checkpoint or an OOM would otherwise never reach it, and /readyz
     # would report phantom capacity for the 12h life of the stale registration.
-    queue = Queue(QUEUE_NAME, connection=get_redis())
-    worker = SimpleWorker([queue], connection=get_redis())
+    queue = get_queue()
+    worker = SimpleWorker([queue], connection=get_redis(),
+                          name=os.environ.setdefault("RQ_WORKER_NAME",
+                                                     socket.gethostname()))
     for other in Worker.all(queue=queue):
         if other.name != worker.name:
             log.warning("burying registration from dead worker %s", other.name)

@@ -47,6 +47,10 @@ app = FastAPI(
 VALID_QUALITY = ("fast", "balanced", "best")
 VALID_FORMATS = ("wav", "flac")
 
+# RQ workers refresh their heartbeat well inside this window; anything older
+# belongs to a process that is gone.
+STALE_WORKER_SECONDS = 600
+
 
 def require_api_key(authorization: str = Header(default="")) -> None:
     """Bearer-token gate on /v1. No-op when BANDIT_API_KEY is unset.
@@ -250,13 +254,34 @@ async def readyz() -> JSONResponse:
     except Exception as exc:
         return JSONResponse({"status": "unavailable", "redis": str(exc)}, 503)
 
+    import time
+
     from rq import Worker
 
-    workers = Worker.count(queue=get_queue())
+    queue = get_queue()
+
+    # Worker.count() reads the rq:workers:<queue> set, which keeps entries for
+    # workers that were killed rather than shut down cleanly. Counting those
+    # overstates capacity, and worse, could report "ok" when nothing is alive.
+    # Trust the heartbeat instead.
+    registered = Worker.all(queue=queue)
+    now = time.time()
+    alive, stale = [], 0
+    for w in registered:
+        beat = w.last_heartbeat
+        if beat is not None and (now - beat.timestamp()) < STALE_WORKER_SECONDS:
+            alive.append(w)
+        else:
+            stale += 1
+
     body = {
-        "status": "ok" if workers else "degraded",
+        "status": "ok" if alive else "degraded",
         "queue": QUEUE_NAME,
-        "queued_jobs": len(get_queue()),
-        "workers": workers,
+        "queued_jobs": len(queue),
+        "workers": len(alive),
     }
-    return JSONResponse(body, 200 if workers else 503)
+    if stale:
+        # Surfaced rather than hidden: a lingering entry usually means a worker
+        # died hard, which is worth noticing.
+        body["stale_registrations"] = stale
+    return JSONResponse(body, 200 if alive else 503)

@@ -176,3 +176,35 @@ def test_stems_reconstruct_the_mixture(separator, mixture, tmp_path):
         float(np.mean(mix[:n] ** 2)) / float(np.mean(residual**2))
     )
     assert snr > 25, f"stems do not reconstruct the mixture (SNR {snr:.1f} dB)"
+
+
+# ---------------------------------------------------------------------------
+# Job-state regressions (no inference; these are pure logic)
+# ---------------------------------------------------------------------------
+
+def test_staleness_uses_updated_at_not_ttl():
+    """Staleness must survive a TTL refresh.
+
+    keep_alive() extends a queued job's TTL without rewriting the record. The
+    original implementation inferred "time since last write" from the remaining
+    TTL, so refreshing it made a dead job look freshly alive forever.
+    """
+    import time as _t
+
+    from bandit_api.jobs import STALE_RUNNING_SECONDS, Job, JobStatus
+
+    fresh = Job(id="a", status=JobStatus.RUNNING)
+    fresh.updated_at = _t.time()
+    assert _t.time() - fresh.updated_at < STALE_RUNNING_SECONDS
+
+    dead = Job(id="b", status=JobStatus.RUNNING)
+    dead.updated_at = _t.time() - (STALE_RUNNING_SECONDS + 60)
+    assert _t.time() - dead.updated_at >= STALE_RUNNING_SECONDS
+
+
+def test_job_roundtrip_preserves_updated_at():
+    from bandit_api.jobs import Job
+
+    j = Job(id="c")
+    j.updated_at = 1234.5
+    assert Job.from_json(j.to_json()).updated_at == 1234.5

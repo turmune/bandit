@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import time
 import urllib.request
@@ -49,6 +50,10 @@ class Job:
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
+    # Set on every save_job(). Staleness was previously inferred from the key's
+    # remaining TTL, which silently breaks as soon as anything refreshes the TTL
+    # without rewriting the record -- which is exactly what keep_alive() does.
+    updated_at: float = field(default_factory=time.time)
 
     def to_json(self) -> str:
         d = asdict(self)
@@ -81,7 +86,20 @@ def _key(job_id: str) -> str:
 
 
 def save_job(job: Job) -> None:
+    job.updated_at = time.time()
     get_redis().set(_key(job.id), job.to_json(), ex=settings.result_ttl_seconds)
+
+
+def keep_alive(job_id: str) -> None:
+    """Extend a record's TTL without counting as progress.
+
+    A queued job is written once, at enqueue. With one worker and jobs running
+    25-95 minutes, a modest backlog pushes later jobs past the 24h TTL: the
+    record evaporates while the RQ entry survives, so the client gets 404 for a
+    job that is still genuinely pending and will later run with nowhere to
+    report its result.
+    """
+    get_redis().expire(_key(job_id), settings.result_ttl_seconds)
 
 
 def load_job(job_id: str) -> Job | None:
@@ -93,7 +111,37 @@ def job_dir(job_id: str) -> Path:
     return settings.outputs_dir / job_id
 
 
+def _cancel_key(job_id: str) -> str:
+    return f"bandit:cancel:{job_id}"
+
+
+def request_cancel(job_id: str) -> None:
+    """Tombstone a job so a worker already running it stops and stays deleted.
+
+    SimpleWorker runs jobs in-process, so there is no work horse to signal. The
+    running job polls this from its progress callback instead. Without it, DELETE
+    returned 204, the worker kept going, and the record came back as "succeeded"
+    with every stem 404ing because the files had been removed underneath it.
+    """
+    get_redis().set(_cancel_key(job_id), "1", ex=settings.job_timeout_seconds)
+
+
+def is_cancelled(job_id: str) -> bool:
+    return bool(get_redis().exists(_cancel_key(job_id)))
+
+
+class JobCancelled(Exception):
+    """Raised inside a running job when its record has been deleted."""
+
+
 def delete_job(job_id: str) -> bool:
+    request_cancel(job_id)
+    try:
+        from rq.job import Job as RQJob
+
+        RQJob.fetch(job_id, connection=get_redis()).cancel()
+    except Exception:
+        pass  # not queued, or already gone
     existed = bool(get_redis().delete(_key(job_id)))
     shutil.rmtree(job_dir(job_id), ignore_errors=True)
     for leftover in settings.inbox_dir.glob(f"{job_id}.*"):
@@ -166,11 +214,7 @@ def settle_if_stale(job: Job) -> Job:
     if job.status is not JobStatus.RUNNING:
         return job
 
-    ttl = get_redis().ttl(_key(job.id))
-    if ttl is None or ttl < 0:  # no expiry set, or key already gone
-        return job
-
-    silent_for = settings.result_ttl_seconds - ttl
+    silent_for = time.time() - (job.updated_at or job.created_at)
     if silent_for < STALE_RUNNING_SECONDS:
         return job
 
@@ -245,7 +289,7 @@ def reconcile_orphaned_jobs() -> int:
     return orphaned
 
 
-def _materialize_input(job_id: str, source: str) -> Path:
+def _materialize_input(job: Job, source: str) -> Path:
     """Return a local path for ``source``, downloading it if it is a URL.
 
     Fetching happens in the worker rather than the API so that a slow origin
@@ -255,8 +299,9 @@ def _materialize_input(job_id: str, source: str) -> Path:
         return Path(source)
 
     settings.inbox_dir.mkdir(parents=True, exist_ok=True)
-    dest = settings.inbox_dir / f"{job_id}.download"
+    dest = settings.inbox_dir / f"{job.id}.download"
     log.info("fetching %s", source)
+    last_stamp = time.time()
     with urllib.request.urlopen(source, timeout=60) as resp, dest.open("wb") as out:
         downloaded = 0
         while block := resp.read(1 << 20):
@@ -267,6 +312,11 @@ def _materialize_input(job_id: str, source: str) -> Path:
                     f"source exceeds max_upload_bytes ({settings.max_upload_bytes} B)"
                 )
             out.write(block)
+            # A slow fetch writes nothing for minutes; without a heartbeat here
+            # settle_if_stale() would declare this live job dead.
+            if time.time() - last_stamp > 60:
+                last_stamp = time.time()
+                save_job(job)
     return dest
 
 
@@ -284,7 +334,7 @@ def run_separation(job_id: str, input_path: str) -> dict:
 
     local_input = input_path
     try:
-        local_input = str(_materialize_input(job_id, input_path))
+        local_input = str(_materialize_input(job, input_path))
         # Fetching a source URL writes nothing; stamp the record so a slow
         # download is not mistaken for a dead worker by settle_if_stale().
         save_job(job)
@@ -299,6 +349,8 @@ def run_separation(job_id: str, input_path: str) -> dict:
         last_written = 0.0
 
         def on_progress(fraction: float) -> None:
+            if is_cancelled(job_id):
+                raise JobCancelled(job_id)
             # Redis write per segment, not per chunk; throttle anyway so a long
             # file does not hammer it.
             nonlocal last_written
@@ -317,9 +369,21 @@ def run_separation(job_id: str, input_path: str) -> dict:
             progress_cb=on_progress,
         )
 
+        # The reaper sweeps output dirs by mtime, and a directory's mtime is
+        # set when its files are *created* -- i.e. at job start, since all stem
+        # files are opened up front. Left alone, a 90-minute job's artifacts are
+        # deleted 90 minutes before its record expires, leaving a "succeeded"
+        # job whose every stem download 404s. Restamp it at completion.
+        os.utime(job_dir(job_id), None)
+
         job.status = JobStatus.SUCCEEDED
         job.progress = 1.0
         job.stems = sorted(paths)
+    except JobCancelled:
+        log.info("job %s cancelled by DELETE", job_id)
+        Path(local_input).unlink(missing_ok=True)
+        shutil.rmtree(job_dir(job_id), ignore_errors=True)
+        return {"job_id": job_id, "cancelled": True}
     except Exception as exc:
         log.exception("job %s failed", job_id)
         job.status = JobStatus.FAILED
@@ -327,9 +391,11 @@ def run_separation(job_id: str, input_path: str) -> dict:
         raise
     finally:
         job.finished_at = time.time()
-        save_job(job)
         # The source audio is dead weight once separated.
         Path(local_input).unlink(missing_ok=True)
-        _notify(job)
+        # Neither resurrect nor announce a record the client deleted mid-flight.
+        if not is_cancelled(job_id):
+            save_job(job)
+            _notify(job)
 
     return {"job_id": job_id, "stems": job.stems}

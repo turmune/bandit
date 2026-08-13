@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import re
 import secrets
+import time
 import uuid
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from pydantic import BaseModel, Field, HttpUrl
 
 from .config import settings
 from .jobs import (
+    STALE_RUNNING_SECONDS,
     Job,
     JobStatus,
     QUEUE_NAME,
@@ -27,6 +29,7 @@ from .jobs import (
     get_queue,
     get_redis,
     job_dir,
+    keep_alive,
     load_job,
     save_job,
     settle_if_stale,
@@ -209,6 +212,14 @@ async def get_job(job_id: str) -> JobResponse:
     job = load_job(job_id)
     if job is None:
         raise HTTPException(404, "job not found or expired")
+
+    # A queued job is written once, at enqueue. With a single worker and jobs
+    # running 25-95 minutes, a backlog pushes later jobs past the 24h TTL: the
+    # record evaporates while the RQ entry survives, so the client 404s on a job
+    # that is still pending and will later run with nowhere to report a result.
+    if job.status in (JobStatus.QUEUED, JobStatus.RUNNING):
+        keep_alive(job_id)
+
     # Self-heal a job whose worker died and never came back: reconciliation at
     # worker startup cannot help if no worker ever starts.
     job = settle_if_stale(job)
@@ -258,8 +269,6 @@ async def readyz() -> JSONResponse:
     except Exception as exc:
         return JSONResponse({"status": "unavailable", "redis": str(exc)}, 503)
 
-    import time
-
     from rq import Worker
 
     queue = get_queue()
@@ -270,18 +279,28 @@ async def readyz() -> JSONResponse:
     # Trust the heartbeat instead.
     registered = Worker.all(queue=queue)
     now = time.time()
-    alive, stale = [], 0
+    alive, stale, _stale = [], 0, []
     for w in registered:
-        # A busy worker counts as alive regardless of heartbeat age.
-        # SimpleWorker runs jobs in-process with no monitoring loop, so it does
-        # not refresh its heartbeat while working -- measured climbing past 368s
-        # on a normal job. Since jobs here run 20-95 minutes, treating a stale
-        # heartbeat as death would report 503 through every healthy long job.
-        # A worker killed *while* busy is handled by reconcile_orphaned_jobs()
-        # at the next worker start, which is what actually matters.
+        # A busy worker cannot be judged by heartbeat age: SimpleWorker runs
+        # jobs in-process with no monitoring loop, so it never refreshes the
+        # heartbeat while working. But "busy" alone is not proof of life either
+        # -- RQ pins a busy registration's TTL to job_timeout + 60 (12h here),
+        # so a worker SIGKILLed mid-job stays frozen at state=busy for half a
+        # day and would report the service healthy with zero processes running.
+        #
+        # Judge it by its job instead: a live job rewrites its own record every
+        # couple of seconds via the progress callback.
         if w.get_state() == "busy":
-            alive.append(w)
-            continue
+            current = w.get_current_job_id()
+            live = load_job(current) if current else None
+            if live is not None:
+                silent = time.time() - (live.updated_at or live.created_at)
+                (alive if silent < STALE_RUNNING_SECONDS else _stale).append(w)
+                if silent >= STALE_RUNNING_SECONDS:
+                    stale += 1
+                continue
+            # No job record to corroborate: fall through to the heartbeat check
+            # rather than trusting the busy flag on its own.
 
         beat = w.last_heartbeat
         if beat is not None and (now - beat.timestamp()) < STALE_WORKER_SECONDS:

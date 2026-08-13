@@ -34,6 +34,18 @@ def main() -> int:
     )
     log = logging.getLogger("bandit.worker")
 
+    # Bury registrations from previous incarnations FIRST. Only one worker runs
+    # at a time, so anything registered that is not us is dead. This has to
+    # precede the checkpoint check and the model load: a worker crash-looping on
+    # a bad checkpoint or an OOM would otherwise never reach it, and /readyz
+    # would report phantom capacity for the 12h life of the stale registration.
+    queue = Queue(QUEUE_NAME, connection=get_redis())
+    worker = SimpleWorker([queue], connection=get_redis())
+    for other in Worker.all(queue=queue):
+        if other.name != worker.name:
+            log.warning("burying registration from dead worker %s", other.name)
+            other.register_death()
+
     if not settings.ckpt_path.exists():
         log.error(
             "checkpoint missing at %s -- run scripts/fetch_weights.py",
@@ -57,19 +69,6 @@ def main() -> int:
     get_separator()
 
     log.info("listening on queue %r", QUEUE_NAME)
-    queue = Queue(QUEUE_NAME, connection=get_redis())
-    worker = SimpleWorker([queue], connection=get_redis())
-
-    # Bury registrations left by previous incarnations. Only one worker runs at
-    # a time, so anything registered that is not us is dead. RQ will not reap
-    # these on its own: a worker killed mid-job holds a registration keyed to
-    # the job timeout (12h here), so /readyz would report phantom capacity for
-    # the rest of the day.
-    for other in Worker.all(queue=queue):
-        if other.name != worker.name:
-            log.warning("burying registration from dead worker %s", other.name)
-            other.register_death()
-
     worker.work(with_scheduler=False)
     return 0
 

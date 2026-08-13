@@ -142,6 +142,62 @@ def _notify(job: Job) -> None:
         log.warning("callback to %s failed: %s", job.callback_url, exc)
 
 
+def reconcile_orphaned_jobs() -> int:
+    """Fail any job still marked ``running`` at worker startup.
+
+    Exactly one worker runs at a time, so if this process is only now booting,
+    nothing can legitimately be mid-flight. A worker killed mid-job -- OOM, a
+    redeploy, a host reboot -- never reaches ``run_separation``'s finally block,
+    so its record would sit at "running" until the 24h TTL expired. A client
+    polling it would wait forever for a status that can never change.
+
+    Failing rather than requeueing is deliberate: whatever killed the worker
+    (most often memory) would very likely kill it again on the same input, and
+    a crash-loop is worse than an honest error.
+    """
+    redis = get_redis()
+    orphaned = 0
+
+    for key in redis.scan_iter(match="bandit:job:*", count=100):
+        raw = redis.get(key)
+        if not raw:
+            continue
+        try:
+            job = Job.from_json(raw)
+        except Exception:
+            log.warning("skipping unreadable job record %r", key)
+            continue
+
+        if job.status is not JobStatus.RUNNING:
+            continue
+
+        # Drop it from RQ first. RQ may otherwise re-dispatch the interrupted
+        # job, which would race this reconciliation: the client would see
+        # "failed" and then, minutes later, "succeeded" -- or two webhooks
+        # contradicting each other. Cancelling makes the outcome deterministic.
+        try:
+            from rq.job import Job as RQJob
+
+            rq_job = RQJob.fetch(job.id, connection=redis)
+            rq_job.cancel()
+            rq_job.delete()
+        except Exception as exc:  # already gone, or never registered
+            log.debug("no RQ job to cancel for %s (%s)", job.id, exc)
+
+        job.status = JobStatus.FAILED
+        job.error = (
+            "worker restarted while this job was running; it was not resumed. "
+            "Retry the job, or use a lower quality preset if the input is long."
+        )
+        job.finished_at = time.time()
+        save_job(job)
+        _notify(job)
+        orphaned += 1
+        log.warning("marked orphaned job %s as failed", job.id)
+
+    return orphaned
+
+
 def _materialize_input(job_id: str, source: str) -> Path:
     """Return a local path for ``source``, downloading it if it is a URL.
 

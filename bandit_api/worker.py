@@ -19,7 +19,12 @@ import sys
 from rq import Queue, SimpleWorker
 
 from .config import settings
-from .jobs import QUEUE_NAME, get_redis, get_separator
+from .jobs import (
+    QUEUE_NAME,
+    get_redis,
+    get_separator,
+    reconcile_orphaned_jobs,
+)
 
 
 def main() -> int:
@@ -38,6 +43,14 @@ def main() -> int:
 
     settings.inbox_dir.mkdir(parents=True, exist_ok=True)
     settings.outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Anything still flagged "running" belongs to a previous incarnation of
+    # this worker and is never coming back. Settle those before accepting new
+    # work, so clients polling them get an answer instead of hanging.
+    orphaned = reconcile_orphaned_jobs()
+    if orphaned:
+        log.warning("failed %d job(s) orphaned by a previous worker restart",
+                    orphaned)
 
     # Load before accepting work so the first request is not penalised and so
     # a broken checkpoint fails the container at boot rather than mid-job.

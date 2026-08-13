@@ -55,6 +55,8 @@ def main() -> int:
     ap.add_argument("--ckpt", default=Path("models/checkpoint-multi.ckpt"), type=Path)
     ap.add_argument("--seconds", type=float, default=20.0, help="excerpt length")
     ap.add_argument("--threads", type=int, default=6)
+    ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
+                    help="where to run the model (default: cpu)")
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--quality", nargs="*", default=list(QUALITY_PRESETS))
     ap.add_argument("--outdir", type=Path, default=Path("data/bench"))
@@ -66,11 +68,18 @@ def main() -> int:
         args.audio, args.seconds, args.outdir / "_excerpt.wav"
     )
 
-    print(f"torch {torch.__version__} | threads={args.threads} | batch={args.batch}")
+    device_note = args.device
+    if args.device == "cuda":
+        if not torch.cuda.is_available():
+            print("CUDA requested but not available -- is this a CUDA torch build?")
+            return 1
+        device_note = f"cuda ({torch.cuda.get_device_name(0)})"
+    print(f"torch {torch.__version__} | device={device_note} | "
+          f"threads={args.threads} | batch={args.batch}")
     print(f"excerpt: {duration:.1f}s @ {SAMPLE_RATE} Hz\n")
 
     t0 = time.perf_counter()
-    sep = Separator(args.ckpt, n_threads=args.threads)
+    sep = Separator(args.ckpt, device=args.device, n_threads=args.threads)
     load_s = time.perf_counter() - t0
     print(f"model load: {load_s:.1f}s (paid once per worker, not per job)\n")
 

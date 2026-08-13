@@ -143,8 +143,10 @@ class Separator:
     ):
         self.device = device
         self.stems = list(stems or STEMS)
-        if device == "cpu":
-            self.n_threads = configure_threads(n_threads)
+        # Thread pinning is a CPU concern; on an accelerator the host threads do
+        # nothing but feed it. Always set the attribute so callers need not care.
+        self.n_threads = configure_threads(n_threads) if device == "cpu" else 0
+        if self.n_threads:
             log.info("torch intra-op threads: %d", self.n_threads)
         self.model = load_bandit(ckpt_path, stems=self.stems, device=device)
 

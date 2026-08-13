@@ -226,7 +226,7 @@ def get_separator():
         t0 = time.perf_counter()
         _separator = Separator(
             settings.ckpt_path,
-            device="cpu",
+            device=settings.device,
             n_threads=settings.threads,
         )
         log.info("model ready in %.1fs", time.perf_counter() - t0)

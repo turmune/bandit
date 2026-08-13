@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     result_ttl_seconds: int = 24 * 3600
     job_timeout_seconds: int = 12 * 3600
 
+    # "cpu" or "cuda". The inference path is device-agnostic; this is the only
+    # thing that decides where a worker runs the model.
+    device: str = "cpu"
+
     # A running job rewrites its record every few seconds via the progress
     # callback. This much silence means nothing is behind it. Generous on
     # purpose: the pre-inference phases (fetching a source URL, ffmpeg-decoding

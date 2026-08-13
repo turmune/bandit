@@ -268,6 +268,17 @@ async def readyz() -> JSONResponse:
     now = time.time()
     alive, stale = [], 0
     for w in registered:
+        # A busy worker counts as alive regardless of heartbeat age.
+        # SimpleWorker runs jobs in-process with no monitoring loop, so it does
+        # not refresh its heartbeat while working -- measured climbing past 368s
+        # on a normal job. Since jobs here run 20-95 minutes, treating a stale
+        # heartbeat as death would report 503 through every healthy long job.
+        # A worker killed *while* busy is handled by reconcile_orphaned_jobs()
+        # at the next worker start, which is what actually matters.
+        if w.get_state() == "busy":
+            alive.append(w)
+            continue
+
         beat = w.last_heartbeat
         if beat is not None and (now - beat.timestamp()) < STALE_WORKER_SECONDS:
             alive.append(w)

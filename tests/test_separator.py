@@ -182,24 +182,47 @@ def test_stems_reconstruct_the_mixture(separator, mixture, tmp_path):
 # Job-state regressions (no inference; these are pure logic)
 # ---------------------------------------------------------------------------
 
-def test_staleness_uses_updated_at_not_ttl():
-    """Staleness must survive a TTL refresh.
+def test_is_stale_only_fires_for_silent_running_jobs():
+    """Exercises the predicate itself, which all three call sites now share.
 
-    keep_alive() extends a queued job's TTL without rewriting the record. The
-    original implementation inferred "time since last write" from the remaining
-    TTL, so refreshing it made a dead job look freshly alive forever.
+    Previously this asserted arithmetic on values it had just assigned, so no
+    change to jobs.py could have failed it.
     """
     import time as _t
 
-    from bandit_api.jobs import STALE_RUNNING_SECONDS, Job, JobStatus
+    from bandit_api.config import settings
+    from bandit_api.jobs import Job, JobStatus
+
+    long_ago = _t.time() - settings.stale_job_seconds - 1
 
     fresh = Job(id="a", status=JobStatus.RUNNING)
-    fresh.updated_at = _t.time()
-    assert _t.time() - fresh.updated_at < STALE_RUNNING_SECONDS
+    assert not fresh.is_stale, "a job written just now is not stale"
 
     dead = Job(id="b", status=JobStatus.RUNNING)
-    dead.updated_at = _t.time() - (STALE_RUNNING_SECONDS + 60)
-    assert _t.time() - dead.updated_at >= STALE_RUNNING_SECONDS
+    dead.updated_at = long_ago
+    assert dead.is_stale
+
+    # Terminal jobs are silent forever by definition and must never be resettled.
+    for terminal in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.QUEUED):
+        j = Job(id="c", status=terminal)
+        j.updated_at = long_ago
+        assert not j.is_stale, f"{terminal.value} must not be treated as stale"
+
+
+def test_terminal_jobs_get_the_result_ttl_others_get_longer():
+    """A queued job must not inherit a *result* retention policy.
+
+    With one worker and 25-95 minute jobs, a backlog pushed later jobs past the
+    24h result TTL and their records vanished while still pending.
+    """
+    from bandit_api.config import settings
+    from bandit_api.jobs import Job, JobStatus
+
+    assert Job(id="a", status=JobStatus.SUCCEEDED).is_terminal
+    assert Job(id="b", status=JobStatus.FAILED).is_terminal
+    assert not Job(id="c", status=JobStatus.QUEUED).is_terminal
+    assert not Job(id="d", status=JobStatus.RUNNING).is_terminal
+    assert settings.job_timeout_seconds > 0  # non-terminal grace is non-trivial
 
 
 def test_job_roundtrip_preserves_updated_at():

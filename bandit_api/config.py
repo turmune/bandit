@@ -29,6 +29,21 @@ class Settings(BaseSettings):
     result_ttl_seconds: int = 24 * 3600
     job_timeout_seconds: int = 12 * 3600
 
+    # A running job rewrites its record every few seconds via the progress
+    # callback. This much silence means nothing is behind it. Generous on
+    # purpose: the pre-inference phases (fetching a source URL, ffmpeg-decoding
+    # a long video) write nothing, and failing a live job is worse than being
+    # slow to notice a dead one.
+    stale_job_seconds: int = 30 * 60
+
+    # The worker refreshes a liveness key from a daemon thread, independently of
+    # what it is doing. Missing key => no worker process.
+    worker_alive_ttl_seconds: int = 90
+
+    # Webhooks are fire-and-forget; nobody waits on the result, and a slow
+    # callback host must not hold up a request or worker startup.
+    callback_timeout_seconds: int = 5
+
     max_upload_bytes: int = 2 * 1024**3  # 2 GiB
 
     # When set, every /v1 route requires `Authorization: Bearer <key>`.

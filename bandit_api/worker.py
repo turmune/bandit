@@ -24,6 +24,7 @@ from .jobs import (
     get_redis,
     get_separator,
     reconcile_orphaned_jobs,
+    start_liveness_heartbeat,
 )
 
 
@@ -67,6 +68,10 @@ def main() -> int:
     # Load before accepting work so the first request is not penalised and so
     # a broken checkpoint fails the container at boot rather than mid-job.
     get_separator()
+
+    # Assert liveness for the rest of this process's life. Started after the
+    # model loads so /readyz stays honest during the first-boot weight download.
+    start_liveness_heartbeat(worker.name)
 
     log.info("listening on queue %r", QUEUE_NAME)
     worker.work(with_scheduler=False)

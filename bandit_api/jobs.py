@@ -55,6 +55,23 @@ class Job:
     # without rewriting the record -- which is exactly what keep_alive() does.
     updated_at: float = field(default_factory=time.time)
 
+    @property
+    def silent_for(self) -> float:
+        """Seconds since anything last wrote this record."""
+        return time.time() - self.updated_at
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in (JobStatus.SUCCEEDED, JobStatus.FAILED)
+
+    @property
+    def is_stale(self) -> bool:
+        """Running, but nothing has touched it for long enough to be dead."""
+        return (
+            self.status is JobStatus.RUNNING
+            and self.silent_for >= settings.stale_job_seconds
+        )
+
     def to_json(self) -> str:
         d = asdict(self)
         d["status"] = self.status.value
@@ -86,20 +103,26 @@ def _key(job_id: str) -> str:
 
 
 def save_job(job: Job) -> None:
-    job.updated_at = time.time()
-    get_redis().set(_key(job.id), job.to_json(), ex=settings.result_ttl_seconds)
+    """Persist a job, expiring it on a schedule that matches its status.
 
+    ``result_ttl_seconds`` is a *result* retention policy, so applying it to a
+    job that has no result yet is simply wrong: a queued job is written once, at
+    enqueue, and with one worker and 25-95 minute jobs a backlog pushes later
+    jobs past 24h. The record would evaporate while the RQ entry survived,
+    404ing a job that was still genuinely pending.
 
-def keep_alive(job_id: str) -> None:
-    """Extend a record's TTL without counting as progress.
-
-    A queued job is written once, at enqueue. With one worker and jobs running
-    25-95 minutes, a modest backlog pushes later jobs past the 24h TTL: the
-    record evaporates while the RQ entry survives, so the client gets 404 for a
-    job that is still genuinely pending and will later run with nowhere to
-    report its result.
+    Making the TTL depend on status fixes that where the state is written, so it
+    also holds for a job nobody ever polls -- the documented callback_url flow.
     """
-    get_redis().expire(_key(job_id), settings.result_ttl_seconds)
+    job.updated_at = time.time()
+    ttl = (
+        settings.result_ttl_seconds
+        if job.is_terminal
+        # Long enough to outlive the queue plus the job itself; the clock that
+        # actually matters restarts when the job settles.
+        else settings.result_ttl_seconds + settings.job_timeout_seconds
+    )
+    get_redis().set(_key(job.id), job.to_json(), ex=ttl)
 
 
 def load_job(job_id: str) -> Job | None:
@@ -113,6 +136,63 @@ def job_dir(job_id: str) -> Path:
 
 def _cancel_key(job_id: str) -> str:
     return f"bandit:cancel:{job_id}"
+
+
+WORKER_ALIVE_KEY = "bandit:worker:alive"
+
+
+def worker_is_live() -> bool:
+    """Is a worker process actually running?
+
+    Deliberately not derived from RQ's registry or from job records. RQ pins a
+    busy worker's registration to job_timeout (12h here) and SimpleWorker never
+    refreshes its heartbeat mid-job, so a killed worker looks alive for half a
+    day; inferring liveness from a job's progress writes instead couples
+    readiness to the Job schema and forces one timeout to serve two opposing
+    policies. The worker asserts its own existence on a short TTL, so the key is
+    gone within ``worker_alive_ttl_seconds`` of the process dying.
+
+    "Process exists" and "this job is progressing" are separate questions:
+    ``Job.is_stale`` answers the second.
+    """
+    return bool(get_redis().exists(WORKER_ALIVE_KEY))
+
+
+def start_liveness_heartbeat(name: str) -> None:
+    """Refresh the liveness key from a daemon thread for the process lifetime.
+
+    A thread rather than a call inside the work loop: it keeps beating through
+    model loading, a blocking ffmpeg decode, and idle waits alike, so there is
+    no phase where a healthy worker looks dead. It dies with the process, which
+    is exactly the semantics wanted.
+    """
+    import threading
+
+    ttl = settings.worker_alive_ttl_seconds
+
+    def beat() -> None:
+        while True:
+            try:
+                get_redis().set(WORKER_ALIVE_KEY, name, ex=ttl)
+            except Exception as exc:
+                log.warning("liveness heartbeat failed: %s", exc)
+            time.sleep(max(5, ttl // 3))
+
+    get_redis().set(WORKER_ALIVE_KEY, name, ex=ttl)
+    threading.Thread(target=beat, name="liveness", daemon=True).start()
+
+
+def _cancel_rq_job(job_id: str, *, delete: bool = False) -> None:
+    """Drop a job from RQ. Missing/never-registered jobs are not an error."""
+    try:
+        from rq.job import Job as RQJob
+
+        rq_job = RQJob.fetch(job_id, connection=get_redis())
+        rq_job.cancel()
+        if delete:
+            rq_job.delete()
+    except Exception as exc:
+        log.debug("no RQ job to cancel for %s (%s)", job_id, exc)
 
 
 def request_cancel(job_id: str) -> None:
@@ -136,12 +216,7 @@ class JobCancelled(Exception):
 
 def delete_job(job_id: str) -> bool:
     request_cancel(job_id)
-    try:
-        from rq.job import Job as RQJob
-
-        RQJob.fetch(job_id, connection=get_redis()).cancel()
-    except Exception:
-        pass  # not queued, or already gone
+    _cancel_rq_job(job_id)
     existed = bool(get_redis().delete(_key(job_id)))
     shutil.rmtree(job_dir(job_id), ignore_errors=True)
     for leftover in settings.inbox_dir.glob(f"{job_id}.*"):
@@ -185,9 +260,33 @@ def _notify(job: Job) -> None:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        urllib.request.urlopen(req, timeout=15).close()
+        urllib.request.urlopen(
+            req, timeout=settings.callback_timeout_seconds
+        ).close()
     except Exception as exc:  # a broken webhook must not fail the job
         log.warning("callback to %s failed: %s", job.callback_url, exc)
+
+
+def fail_job(job: Job, reason: str, *, drop_rq: bool = False) -> Job:
+    """Settle a job as failed. The single owner of that transition.
+
+    Previously open-coded in three places, which had already drifted: only one
+    dropped the RQ job, only one honoured the cancel tombstone. Anything added
+    to what failing means -- a reason code, a retry counter, artifact cleanup --
+    belongs here and nowhere else.
+    """
+    if drop_rq:
+        _cancel_rq_job(job.id, delete=True)
+
+    job.status = JobStatus.FAILED
+    job.error = reason
+    job.finished_at = time.time()
+
+    # Never resurrect or announce a record the client deleted mid-flight.
+    if not is_cancelled(job.id):
+        save_job(job)
+        _notify(job)
+    return job
 
 
 # A running job rewrites its record every couple of seconds via the progress
@@ -202,35 +301,52 @@ def settle_if_stale(job: Job) -> Job:
     """Fail a job whose record has stopped being written.
 
     ``reconcile_orphaned_jobs`` only runs when a worker *starts*. If the worker
-    dies and never comes back -- the host is down, the container is stopped, the
-    restart policy gave up -- nothing settles the job and a client polls a
-    permanently frozen "running" until the 24h record TTL expires.
-
-    ``save_job`` re-sets that TTL on every write, so the *remaining* TTL is a
-    free proxy for time-since-last-write: no extra field, no clock skew between
-    processes. Checking it on read makes the API self-healing regardless of
+    dies and never comes back -- host down, container stopped, restart policy
+    exhausted -- nothing settles the job and a client polls a frozen "running"
+    until the record expires. Checking on read makes recovery independent of
     whether a worker ever returns.
+
+    Staleness itself lives on ``Job.is_stale`` so that this, reconciliation and
+    the readiness probe cannot drift apart on what "dead" means.
     """
-    if job.status is not JobStatus.RUNNING:
+    if not job.is_stale:
         return job
 
-    silent_for = time.time() - (job.updated_at or job.created_at)
-    if silent_for < STALE_RUNNING_SECONDS:
-        return job
+    silent_min = job.silent_for / 60
+    log.warning("job %s silent for %.0f min; settling as failed", job.id, silent_min)
+    return fail_job(
+        job,
+        f"no progress for {silent_min:.0f} minutes; the worker handling this "
+        f"job is gone. Retry the job.",
+    )
 
-    log.warning(
-        "job %s has not been written in %.0f min; settling as failed",
-        job.id, silent_for / 60,
-    )
-    job.status = JobStatus.FAILED
-    job.error = (
-        f"no progress for {silent_for / 60:.0f} minutes; the worker handling "
-        f"this job is gone. Retry the job."
-    )
-    job.finished_at = time.time()
-    save_job(job)
-    _notify(job)
-    return job
+
+def _fail_running(redis: "redis.Redis", keys: list) -> int:
+    """Fail every RUNNING record among ``keys``. Returns how many."""
+    if not keys:
+        return 0
+    failed = 0
+    for raw in redis.mget(keys):
+        if not raw:
+            continue
+        try:
+            job = Job.from_json(raw)
+        except Exception:
+            log.warning("skipping unreadable job record")
+            continue
+        if job.status is not JobStatus.RUNNING:
+            continue
+        # drop_rq: otherwise RQ re-dispatches the interrupted job and races this
+        # reconciliation, giving the client "failed" then "succeeded".
+        fail_job(
+            job,
+            "worker restarted while this job was running; it was not resumed. "
+            "Retry the job.",
+            drop_rq=True,
+        )
+        log.warning("marked orphaned job %s as failed", job.id)
+        failed += 1
+    return failed
 
 
 def reconcile_orphaned_jobs() -> int:
@@ -249,42 +365,15 @@ def reconcile_orphaned_jobs() -> int:
     redis = get_redis()
     orphaned = 0
 
-    for key in redis.scan_iter(match="bandit:job:*", count=100):
-        raw = redis.get(key)
-        if not raw:
+    # MGET each scan batch rather than a round-trip per key.
+    batch: list[bytes] = []
+    for key in redis.scan_iter(match=_key("*"), count=100):
+        batch.append(key)
+        if len(batch) < 100:
             continue
-        try:
-            job = Job.from_json(raw)
-        except Exception:
-            log.warning("skipping unreadable job record %r", key)
-            continue
-
-        if job.status is not JobStatus.RUNNING:
-            continue
-
-        # Drop it from RQ first. RQ may otherwise re-dispatch the interrupted
-        # job, which would race this reconciliation: the client would see
-        # "failed" and then, minutes later, "succeeded" -- or two webhooks
-        # contradicting each other. Cancelling makes the outcome deterministic.
-        try:
-            from rq.job import Job as RQJob
-
-            rq_job = RQJob.fetch(job.id, connection=redis)
-            rq_job.cancel()
-            rq_job.delete()
-        except Exception as exc:  # already gone, or never registered
-            log.debug("no RQ job to cancel for %s (%s)", job.id, exc)
-
-        job.status = JobStatus.FAILED
-        job.error = (
-            "worker restarted while this job was running; it was not resumed. "
-            "Retry the job, or use a lower quality preset if the input is long."
-        )
-        job.finished_at = time.time()
-        save_job(job)
-        _notify(job)
-        orphaned += 1
-        log.warning("marked orphaned job %s as failed", job.id)
+        orphaned += _fail_running(redis, batch)
+        batch.clear()
+    orphaned += _fail_running(redis, batch)
 
     return orphaned
 
@@ -335,9 +424,6 @@ def run_separation(job_id: str, input_path: str) -> dict:
     local_input = input_path
     try:
         local_input = str(_materialize_input(job, input_path))
-        # Fetching a source URL writes nothing; stamp the record so a slow
-        # download is not mistaken for a dead worker by settle_if_stale().
-        save_job(job)
         separator = get_separator()
         cfg = SeparationConfig(
             quality=job.quality,
@@ -349,15 +435,15 @@ def run_separation(job_id: str, input_path: str) -> dict:
         last_written = 0.0
 
         def on_progress(fraction: float) -> None:
-            if is_cancelled(job_id):
-                raise JobCancelled(job_id)
-            # Redis write per segment, not per chunk; throttle anyway so a long
-            # file does not hammer it.
+            # Throttled: the callback fires per inference batch, and both the
+            # cancel check and the write are round-trips.
             nonlocal last_written
             now = time.time()
             if now - last_written < 2.0 and fraction < 1.0:
                 return
             last_written = now
+            if is_cancelled(job_id):
+                raise JobCancelled(job_id)
             job.progress = round(fraction, 4)
             save_job(job)
 
@@ -379,23 +465,22 @@ def run_separation(job_id: str, input_path: str) -> dict:
         job.status = JobStatus.SUCCEEDED
         job.progress = 1.0
         job.stems = sorted(paths)
-    except JobCancelled:
-        log.info("job %s cancelled by DELETE", job_id)
-        Path(local_input).unlink(missing_ok=True)
-        shutil.rmtree(job_dir(job_id), ignore_errors=True)
-        return {"job_id": job_id, "cancelled": True}
-    except Exception as exc:
-        log.exception("job %s failed", job_id)
-        job.status = JobStatus.FAILED
-        job.error = f"{type(exc).__name__}: {exc}"
-        raise
-    finally:
         job.finished_at = time.time()
-        # The source audio is dead weight once separated.
-        Path(local_input).unlink(missing_ok=True)
-        # Neither resurrect nor announce a record the client deleted mid-flight.
         if not is_cancelled(job_id):
             save_job(job)
             _notify(job)
+        return {"job_id": job_id, "stems": job.stems}
 
-    return {"job_id": job_id, "stems": job.stems}
+    except JobCancelled:
+        log.info("job %s cancelled by DELETE", job_id)
+        shutil.rmtree(job_dir(job_id), ignore_errors=True)
+        return {"job_id": job_id, "cancelled": True}
+
+    except Exception as exc:
+        log.exception("job %s failed", job_id)
+        fail_job(job, f"{type(exc).__name__}: {exc}")
+        raise
+
+    finally:
+        # The source audio is dead weight either way.
+        Path(local_input).unlink(missing_ok=True)

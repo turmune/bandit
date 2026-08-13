@@ -14,43 +14,33 @@ Usage:  python -m bandit_api.healthcheck {worker|api}
 
 from __future__ import annotations
 
-import socket
 import sys
 
 
 def check_worker() -> int:
-    """Pass only if an RQ worker for *this container* is alive in Redis.
+    """Pass only if a worker process is asserting liveness.
 
-    RQ workers refresh a heartbeat key with a TTL, and ``Worker.all()`` only
-    returns those whose key has not expired -- so a crashed or hung process
-    drops out on its own. Matching on hostname keeps one container's probe from
-    passing because a *different* worker is healthy.
+    Shares ``worker_is_live()`` with /readyz rather than re-deriving liveness
+    from RQ's registry. The previous hostname-match-on-Worker.all() approach
+    rested on the premise that crashed workers "drop out on their own", which is
+    false: RQ pins a busy registration to job_timeout, so a worker killed
+    mid-job stayed registered for 12 hours and this probe kept passing.
     """
     try:
-        from rq import Worker
+        from .jobs import get_redis, worker_is_live
 
-        from .jobs import get_redis
-
-        redis = get_redis()
-        redis.ping()
+        get_redis().ping()
     except Exception as exc:
         print(f"redis unreachable: {exc}")
         return 1
 
-    me = socket.gethostname()
-    try:
-        mine = [w for w in Worker.all(connection=redis) if w.hostname == me]
-    except Exception as exc:
-        print(f"could not enumerate workers: {exc}")
+    if not worker_is_live():
+        # Expected while the model loads on first boot, which is why the compose
+        # healthcheck gives this a long start_period.
+        print("no worker heartbeat")
         return 1
 
-    if not mine:
-        # Expected while the model loads on first boot, which is why the
-        # compose healthcheck gives this a long start_period.
-        print(f"no live rq worker registered for host {me}")
-        return 1
-
-    print(f"worker {mine[0].name} alive (state={mine[0].get_state()})")
+    print("worker alive")
     return 0
 
 

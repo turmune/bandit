@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import sys
 
-from rq import Queue, SimpleWorker
+from rq import Queue, SimpleWorker, Worker
 
 from .config import settings
 from .jobs import (
@@ -57,8 +57,19 @@ def main() -> int:
     get_separator()
 
     log.info("listening on queue %r", QUEUE_NAME)
-    worker = SimpleWorker([Queue(QUEUE_NAME, connection=get_redis())],
-                          connection=get_redis())
+    queue = Queue(QUEUE_NAME, connection=get_redis())
+    worker = SimpleWorker([queue], connection=get_redis())
+
+    # Bury registrations left by previous incarnations. Only one worker runs at
+    # a time, so anything registered that is not us is dead. RQ will not reap
+    # these on its own: a worker killed mid-job holds a registration keyed to
+    # the job timeout (12h here), so /readyz would report phantom capacity for
+    # the rest of the day.
+    for other in Worker.all(queue=queue):
+        if other.name != worker.name:
+            log.warning("burying registration from dead worker %s", other.name)
+            other.register_death()
+
     worker.work(with_scheduler=False)
     return 0
 

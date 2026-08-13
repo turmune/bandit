@@ -29,6 +29,7 @@ from .jobs import (
     job_dir,
     load_job,
     save_job,
+    settle_if_stale,
 )
 from .model import STEMS
 
@@ -208,6 +209,9 @@ async def get_job(job_id: str) -> JobResponse:
     job = load_job(job_id)
     if job is None:
         raise HTTPException(404, "job not found or expired")
+    # Self-heal a job whose worker died and never came back: reconciliation at
+    # worker startup cannot help if no worker ever starts.
+    job = settle_if_stale(job)
     position = None
     if job.status is JobStatus.QUEUED:
         ids = get_queue().get_job_ids()

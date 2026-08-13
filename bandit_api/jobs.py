@@ -142,6 +142,53 @@ def _notify(job: Job) -> None:
         log.warning("callback to %s failed: %s", job.callback_url, exc)
 
 
+# A running job rewrites its record every couple of seconds via the progress
+# callback. Half an hour of silence means nothing is behind it. Generous on
+# purpose: the pre-inference phases (fetching a source URL, ffmpeg-decoding a
+# long video) write nothing, and failing a live job would be worse than being
+# slow to notice a dead one.
+STALE_RUNNING_SECONDS = 30 * 60
+
+
+def settle_if_stale(job: Job) -> Job:
+    """Fail a job whose record has stopped being written.
+
+    ``reconcile_orphaned_jobs`` only runs when a worker *starts*. If the worker
+    dies and never comes back -- the host is down, the container is stopped, the
+    restart policy gave up -- nothing settles the job and a client polls a
+    permanently frozen "running" until the 24h record TTL expires.
+
+    ``save_job`` re-sets that TTL on every write, so the *remaining* TTL is a
+    free proxy for time-since-last-write: no extra field, no clock skew between
+    processes. Checking it on read makes the API self-healing regardless of
+    whether a worker ever returns.
+    """
+    if job.status is not JobStatus.RUNNING:
+        return job
+
+    ttl = get_redis().ttl(_key(job.id))
+    if ttl is None or ttl < 0:  # no expiry set, or key already gone
+        return job
+
+    silent_for = settings.result_ttl_seconds - ttl
+    if silent_for < STALE_RUNNING_SECONDS:
+        return job
+
+    log.warning(
+        "job %s has not been written in %.0f min; settling as failed",
+        job.id, silent_for / 60,
+    )
+    job.status = JobStatus.FAILED
+    job.error = (
+        f"no progress for {silent_for / 60:.0f} minutes; the worker handling "
+        f"this job is gone. Retry the job."
+    )
+    job.finished_at = time.time()
+    save_job(job)
+    _notify(job)
+    return job
+
+
 def reconcile_orphaned_jobs() -> int:
     """Fail any job still marked ``running`` at worker startup.
 
@@ -238,6 +285,9 @@ def run_separation(job_id: str, input_path: str) -> dict:
     local_input = input_path
     try:
         local_input = str(_materialize_input(job_id, input_path))
+        # Fetching a source URL writes nothing; stamp the record so a slow
+        # download is not mistaken for a dead worker by settle_if_stale().
+        save_job(job)
         separator = get_separator()
         cfg = SeparationConfig(
             quality=job.quality,

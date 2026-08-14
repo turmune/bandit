@@ -180,6 +180,13 @@ should pass through; the app's own 2 GiB cap (`BANDIT_MAX_UPLOAD_BYTES`) is what
 you will hit first. If a proxy in front of Coolify does cap bodies, use
 `POST /v1/jobs/from-url` and skip the upload path entirely.
 
+**Never redeploy while a job is running.** A Docker build unpacks several GB
+of torch while the worker is holding ~5 GB. On a 16 GB host that has been
+observed exceeding total memory, at which point the kernel kills whichever
+process is largest -- the worker mid-job, and it could as easily be Coolify.
+Check `/readyz` for `queued_jobs: 0` and no running job first, or accept that
+the in-flight job will be abandoned (it settles cleanly with a reason).
+
 **Weights are not baked into the image** — 447 MB on every rebuild, and Coolify
 rebuilds on every push. They live on the `bandit-data` volume, fetched once and
 md5-verified.
@@ -211,8 +218,8 @@ healthy.
 | `BANDIT_DATA_DIR` | `/data` | holds `inbox/`, `outputs/`, `models/` |
 | `BANDIT_CKPT_PATH` | `/data/models/checkpoint-multi-inference.pt` | |
 | `BANDIT_THREADS` | `6` | torch intra-op threads; keep ≈ cores − 2 |
-| `BANDIT_BATCH_SIZE` | `4` | chunks per forward pass; drives peak RAM |
-| `BANDIT_SEGMENT_SECONDS` | `120` | outer segment size; drives peak RAM. **Must be an integer multiple of every hop you use** (4/2/1 s) — 120 satisfies all three; 90 would fail `fast` jobs at runtime |
+| `BANDIT_BATCH_SIZE` | `2` | chunks per forward pass; drives peak RAM |
+| `BANDIT_SEGMENT_SECONDS` | `60` | outer segment size; drives peak RAM. **Must be an integer multiple of every hop you use** (4/2/1 s) — 120 satisfies all three; 90 would fail `fast` jobs at runtime |
 | `BANDIT_DEFAULT_QUALITY` | `balanced` | |
 | `BANDIT_RESULT_TTL_SECONDS` | `86400` | job records and artifacts expire together |
 | `BANDIT_MAX_UPLOAD_BYTES` | `2147483648` | |

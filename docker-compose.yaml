@@ -49,8 +49,8 @@ services:
       # Leave ~2 cores for api + redis + OS. Oversubscribing torch threads
       # slows this workload down; it does not speed it up.
       BANDIT_THREADS: "6"
-      BANDIT_BATCH_SIZE: "4"
-      BANDIT_SEGMENT_SECONDS: "120"
+      BANDIT_BATCH_SIZE: "2"
+      BANDIT_SEGMENT_SECONDS: "60"
       OMP_NUM_THREADS: "6"
       MKL_NUM_THREADS: "6"
     volumes:
@@ -73,7 +73,14 @@ services:
     deploy:
       resources:
         limits:
-          memory: 10G
+          # Must be a limit the host can actually honour with a build running.
+          # At 10G on a 16GB box the container could grow until the *host* ran
+          # out, at which point the kernel picks its own victim -- observed
+          # killing a worker at 5.5GB mid-job during a redeploy, and it could as
+          # easily have been Coolify. Capping below that keeps the blast radius
+          # inside the container, where the restart policy and
+          # reconcile_orphaned_jobs settle the job cleanly.
+          memory: 6G
           cpus: "6.5"
     # One worker. Two would halve each other's cores and double peak RAM on a
     # box that has neither to spare. Scale by adding hosts, not replicas.

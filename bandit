@@ -276,14 +276,29 @@ def cmd_jobs(url: str, key: str) -> int:
         print(dim("no jobs submitted from this machine yet"))
         return 0
     for j in json.loads(STATE.read_text())[-20:]:
-        code, body = api_get(url, key, f"/v1/jobs/{j['job_id']}")
+        try:
+            code, body = api_get(url, key, f"/v1/jobs/{j['job_id']}")
+        except Exception as exc:
+            state = red(f"unreachable ({type(exc).__name__})")
+            print(f"  {j['job_id'][:8]}  {j['source'][:40]:<40}  {state}")
+            continue
+
         if code == 404:
             state = dim("expired")
         else:
-            d = json.loads(body)
-            s = d["status"]
-            colour = {"succeeded": green, "failed": red}.get(s, yellow)
-            state = colour(s) + (f" {d['progress']:.0%}" if s == "running" else "")
+            # A proxy returning 502/503 sends HTML or plain text, not JSON.
+            # Parsing blind meant this crashed with a traceback exactly when the
+            # server was down -- the moment you most want to list your jobs.
+            try:
+                d = json.loads(body)
+            except ValueError:
+                state = red(f"http {code}")
+            else:
+                st = d["status"]
+                colour = {"succeeded": green, "failed": red}.get(st, yellow)
+                state = colour(st) + (
+                    f" {d['progress']:.0%}" if st == "running" else ""
+                )
         print(f"  {j['job_id'][:8]}  {j['source'][:40]:<40}  {state}")
     return 0
 

@@ -1,11 +1,19 @@
 # BandIt v2 Separation API
 
-CPU-only HTTP API around [BandIt v2](https://github.com/kwatcharasupat/bandit-v2),
-which separates cinematic audio into **speech**, **music** and **sfx** stems.
-Packaged for Coolify on an 8 vCPU / 16 GB host.
+HTTP API around [BandIt v2](https://github.com/kwatcharasupat/bandit-v2), which
+separates cinematic audio into **speech**, **music** and **sfx** stems. Runs on
+CPU or GPU — `BANDIT_DEVICE` is the only switch, and the measured CPU numbers
+below are what the GPU path is worth comparing against.
 
-Separation on CPU takes minutes to hours, so the API is asynchronous: you submit
-a job, then poll or receive a webhook.
+Two deployments are supported:
+
+* **CPU**, packaged for Coolify on an 8 vCPU / 16 GB host — `docker-compose.yaml`.
+* **GPU**, a local NVIDIA host reached over a private tailnet —
+  `docker-compose.gpu.yaml` layered on top; its header comment carries the host
+  prerequisites and the exact `docker compose` invocation.
+
+Separation is slow enough on CPU to take minutes to hours, so the API is
+asynchronous either way: you submit a job, then poll or receive a webhook.
 
 ```bash
 curl -X POST https://your-host/v1/jobs \
@@ -130,7 +138,7 @@ Coolify issues the Let's Encrypt certificate during deploy, and that fails if
 the name does not already resolve.
 
 ```
-bandit.efobay.com.   A   <server-ip>
+bandit.example.com.   A   <server-ip>
 ```
 
 **1. Push this repo** somewhere Coolify can read (GitHub/Gitea, public or via a
@@ -152,7 +160,7 @@ BANDIT_API_KEY=<paste: openssl rand -hex 32>
 **4. Domain — on the `api` service only.** In that service's Domains field:
 
 ```
-https://bandit.efobay.com:8000
+https://bandit.example.com:8000
 ```
 
 The `:8000` tells Coolify which container port to route to; it is not part of
@@ -165,10 +173,10 @@ with `"status":"degraded"` until a worker registers.
 **6. Verify.**
 
 ```bash
-curl https://bandit.efobay.com/healthz
-curl https://bandit.efobay.com/readyz          # {"status":"ok","workers":1}
+curl https://bandit.example.com/healthz
+curl https://bandit.example.com/readyz          # {"status":"ok","workers":1}
 
-curl -X POST https://bandit.efobay.com/v1/jobs \
+curl -X POST https://bandit.example.com/v1/jobs \
   -H "Authorization: Bearer $BANDIT_API_KEY" \
   -F file=@clip.wav -F quality=fast
 ```
@@ -237,7 +245,7 @@ cp ~/Music/song.wav data/in/
 
 ```
 $ ./bandit
-https://bandit.efobay.com  ready  1 worker(s), 0 queued
+https://bandit.example.com  ready  1 worker(s), 0 queued
   quality=balanced  1 file(s)
 
 song.wav  38.2MB

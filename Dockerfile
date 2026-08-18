@@ -14,17 +14,29 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# The CPU wheel index matters: the default PyPI torch pulls ~2.5 GB of CUDA
-# libraries that cannot be used on a CPU-only host.
+# Which torch build to install. "cpu" is the default so the CPU-only deployment
+# keeps building exactly as before; a GPU worker host passes a CUDA tag instead:
+#   docker build --build-arg TORCH_VARIANT=cu124 .
+# No CUDA base image is needed -- the cu124 wheels bundle the CUDA runtime
+# libraries themselves, so the host supplies only the driver.
+ARG TORCH_VARIANT=cpu
+
+# The wheel index matters in both directions: PyPI's default torch pulls ~2.5 GB
+# of CUDA libraries a CPU-only host cannot use, and the CPU index yields a build
+# that ignores an accelerator entirely.
 COPY requirements.txt .
-RUN pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+RUN pip install --extra-index-url https://download.pytorch.org/whl/${TORCH_VARIANT} \
     -r requirements.txt \
- # Both indexes carry torch 2.5.1, so resolution to the CUDA build is possible.
- # That silently adds ~5 GB of libraries this host can never use, so assert the
- # CPU build was chosen rather than discovering it from the image size.
- && python -c "import torch, sys; \
-sys.exit(0) if torch.version.cuda is None else sys.exit( \
-    'ERROR: resolved the CUDA build of torch (%s); expected +cpu' % torch.__version__)"
+ # Every index carries torch 2.5.1, so resolving the wrong build is possible and
+ # silent. Two distinct failures to catch: a CPU image carrying ~5 GB of
+ # libraries it can never use, or a GPU image that quietly runs the model on the
+ # CPU at a fraction of the speed. Assert whichever was actually asked for,
+ # rather than discovering it from the image size or a benchmark.
+ && TORCH_VARIANT="${TORCH_VARIANT}" python -c "import os, sys, torch; \
+want_cuda = os.environ['TORCH_VARIANT'] != 'cpu'; \
+sys.exit(0) if bool(torch.version.cuda) == want_cuda else sys.exit( \
+    'ERROR: asked for the %s build but resolved torch %s (cuda=%s)' \
+    % (os.environ['TORCH_VARIANT'], torch.__version__, torch.version.cuda))"
 
 COPY bandit_api/ ./bandit_api/
 COPY scripts/ ./scripts/

@@ -15,7 +15,7 @@ any checkout or any machine without installing torch or a virtualenv.
 
 Configuration is read from --url/--key, then the environment, then .env:
 
-    BANDIT_URL=https://bandit.efobay.com
+    BANDIT_URL=https://<host>.<tailnet>.ts.net
     BANDIT_API_KEY=...
 """
 
@@ -51,7 +51,11 @@ VIDEO_SUFFIXES = {
     ".mp4", ".mkv", ".mov", ".webm", ".ts", ".m4v", ".avi", ".flv", ".wmv",
 }
 
-DEFAULT_URL = "https://bandit.efobay.com"
+# No baked-in host on purpose. The API runs on a private tailnet now, and that
+# hostname is specific to whoever deployed it. A stale default is worse than no
+# default: it turns "you forgot to set BANDIT_URL" into a connection timeout
+# against a host that no longer exists, which reads like the server is down.
+DEFAULT_URL = ""
 
 # ANSI only when attached to a terminal, so piping to a file stays clean.
 _TTY = sys.stdout.isatty()
@@ -95,6 +99,10 @@ def resolve_config(args) -> tuple[str, str]:
         lines = [l.strip() for l in (ROOT / ".env").read_text().splitlines() if l.strip()]
         if len(lines) == 1 and "=" not in lines[0]:
             key = lines[0]
+
+    if not url:
+        sys.exit(red("No API URL. Put BANDIT_URL=https://<host>.<tailnet>.ts.net "
+                     "in .env, or pass --url."))
 
     url = url.rstrip("/")
     # Coolify's domain field takes a :8000 suffix to pick the container port;
@@ -414,7 +422,7 @@ def main() -> int:
                    help="comma-separated subset, e.g. speech or speech,music "
                         "(default: all three)")
     p.add_argument("-f", "--format", default="wav", choices=["wav", "flac"])
-    p.add_argument("--url", help=f"API base URL (default: {DEFAULT_URL})")
+    p.add_argument("--url", help="API base URL; normally read from .env")
     p.add_argument("--key", help="API key; normally read from .env")
     p.add_argument("--poll", type=float, default=5.0, metavar="SEC")
     p.add_argument("--status", action="store_true", help="show server health and exit")

@@ -1,0 +1,66 @@
+# GPU overlay: runs the worker on a local NVIDIA card instead of the CPU.
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml up -d --build
+#
+# Deliberately a separate file rather than edits to docker-compose.yaml: that
+# file is the Coolify deployment, which has no GPU and must keep building
+# unchanged. Only the `worker` service differs here -- api and reaper never
+# import torch, so they stay on the CPU image and the cu124 wheels are pulled
+# once, for one service.
+#
+# Host prerequisites (the image cannot supply these):
+#   * NVIDIA proprietary driver >= 525, 550+ recommended for CUDA 12.4
+#   * NVIDIA Container Toolkit, so Docker can pass the card through
+#   * verify both with: docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
+
+services:
+  worker:
+    build:
+      context: .
+      args:
+        # Asserted at build time in the Dockerfile -- a silent fall back to the
+        # CPU build would show up only as disappointing benchmark numbers.
+        TORCH_VARIANT: cu124
+    environment:
+      # The only switch that decides where the model runs. Everything from
+      # jobs.get_separator() down already threads this through; see config.py.
+      BANDIT_DEVICE: cuda
+
+      # VRAM, not cores, is the constraint now. Chunks within a segment are
+      # independent, so batching them is near-free parallelism -- this is the
+      # throughput knob on a GPU, and unlike segment_seconds it has no chunk-grid
+      # alignment constraint, so raising it cannot change the output, only VRAM.
+      # 8 is a conservative start for a 12 GB card; raise it until `nvidia-smi`
+      # shows the card comfortably full and re-run scripts/benchmark.py.
+      BANDIT_BATCH_SIZE: "8"
+
+      # Left at the base file's values on purpose. Separator skips torch thread
+      # pinning entirely when device != "cpu" (separator.py), so these no longer
+      # affect inference -- but ffmpeg still decodes on the CPU, so the cores are
+      # not idle and there is nothing to reclaim by lowering them.
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+        limits:
+          # Restated rather than inherited: some compose versions replace the
+          # whole `resources` map when an override adds `reservations`.
+          #
+          # Still 6G despite the model living in VRAM now. Peak host RSS is
+          # dominated by the decoded PCM of a long input, not by the model, and
+          # that has not moved. The base file's reasoning for capping below what
+          # the host can honour applies unchanged.
+          memory: 6G
+          cpus: "6.5"
+
+  api:
+    # The base file publishes nothing, because Coolify's proxy routes the domain
+    # to the container port. There is no proxy here, so the port has to be
+    # published to be reachable at all -- bound to loopback, not 0.0.0.0, so
+    # `tailscale serve` fronts it and the card is never exposed to the LAN.
+    ports:
+      - "127.0.0.1:8000:8000"

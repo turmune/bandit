@@ -3,9 +3,17 @@
 Self-contained spec for calling this API from another codebase. Everything an
 implementer needs is here; no other files required.
 
-**Base URL:** `https://bandit.efobay.com`
+**Base URL:** `https://<host>.<tailnet>.ts.net` — ask whoever runs the API, or
+read it from `tailscale serve status` on that machine.
 **Auth:** `Authorization: Bearer <BANDIT_API_KEY>` on every `/v1/*` route.
 Health routes need no auth.
+
+**Network:** the API is on a private tailnet, not the public internet. Your
+service must be a member of that tailnet to reach it at all — install Tailscale
+and `tailscale up`. Nothing needs to be opened inbound on your side: `from-url`
+fetches and `callback_url` webhooks are both outbound *from* the worker, so the
+only requirement is that any URL you hand the API is reachable from the machine
+running it.
 
 ## What it does
 
@@ -22,22 +30,32 @@ the video discarded. Output is always audio (WAV or FLAC), never video.
 
 ## The one thing that shapes your integration
 
-**This is slow and asynchronous.** It runs on CPU, and separation takes
-*minutes to hours*. You submit a job, get an ID back immediately, and collect
-results later. There is no synchronous "send audio, get stems" call.
+**This is asynchronous.** You submit a job, get an ID back immediately, and
+collect results later. There is no synchronous "send audio, get stems" call, and
+faster hardware does not change that — build for it.
 
-Realistic durations for a **3-minute stereo** file:
+Separation runs on a GPU (RTX 3060). The CPU figures this brief used to quote —
+16× realtime at `balanced`, ~47 minutes for a 3-minute file — no longer apply.
+The replacements are left blank on purpose rather than estimated:
 
 | `quality` | ~speed | 3-min file |
 |---|---|---:|
-| `fast` | 7× realtime | ~23 min |
-| `balanced` (default) | 16× realtime | ~47 min |
-| `best` | 32× realtime | ~95 min |
+| `fast` | TBD | TBD |
+| `balanced` (default) | TBD | TBD |
+| `best` | TBD | TBD |
 
-Mono halves these. Short clips are disproportionately slow (fixed padding
-overhead): a 15-second clip takes ~8 minutes at `balanced`.
+Fill these in from `python scripts/benchmark.py --audio <file> --seconds 30
+--device cuda` on the GPU host. Until then, size your timeouts generously and
+treat a job as something that may take a while, not something you can block on.
 
-One worker processes one job at a time; everything else queues.
+Mono halves the work. Short clips are disproportionately slow (fixed padding
+overhead). One worker processes one job at a time; everything else queues.
+
+**Results cross a residential uplink.** The GPU host is on a home connection, so
+the download is often slower than the separation. Two things cut it sharply, and
+both are free: ask for `"output_format": "flac"` (about half the bytes of WAV,
+losslessly), and request only the stems you actually consume — `"stems":
+["speech"]` moves a third as much data as all three.
 
 ## Endpoints
 
@@ -184,15 +202,16 @@ job ID so you can poll as a fallback.
 
 ```bash
 KEY=<your key>
+BASE=https://<host>.<tailnet>.ts.net    # from `tailscale serve status`
 
-curl https://bandit.efobay.com/readyz
+curl $BASE/readyz
 
-curl -X POST https://bandit.efobay.com/v1/jobs \
+curl -X POST $BASE/v1/jobs \
   -H "Authorization: Bearer $KEY" \
   -F file=@clip.wav -F quality=fast -F stems=speech
 
-curl https://bandit.efobay.com/v1/jobs/<job_id> -H "Authorization: Bearer $KEY"
+curl $BASE/v1/jobs/<job_id> -H "Authorization: Bearer $KEY"
 
-curl -O -J https://bandit.efobay.com/v1/jobs/<job_id>/stems/speech \
+curl -O -J $BASE/v1/jobs/<job_id>/stems/speech \
   -H "Authorization: Bearer $KEY"
 ```

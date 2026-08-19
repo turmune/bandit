@@ -36,17 +36,20 @@ faster hardware does not change that — build for it.
 
 Separation runs on a GPU (RTX 3060). The CPU figures this brief used to quote —
 16× realtime at `balanced`, ~47 minutes for a 3-minute file — no longer apply.
-The replacements are left blank on purpose rather than estimated:
+Measured replacements, from `scripts/benchmark.py` on a 30 s stereo excerpt at
+48 kHz, batch 4, on the deployed host:
 
-| `quality` | ~speed | 3-min file |
-|---|---|---:|
-| `fast` | TBD | TBD |
-| `balanced` (default) | TBD | TBD |
-| `best` | TBD | TBD |
+| `quality` | ~xRT | 3-min file | 60-min film |
+|---|---:|---:|---:|
+| `fast` | 0.26× | ~0.8 min | ~16 min |
+| `balanced` (default) | 0.44× | ~1.3 min | ~26 min |
+| `best` | 0.94× | ~2.8 min | ~57 min |
 
-Fill these in from `python scripts/benchmark.py --audio <file> --seconds 30
---device cuda` on the GPU host. Until then, size your timeouts generously and
-treat a job as something that may take a while, not something you can block on.
+xRT is wall time per second of audio, so below 1.0 is faster than realtime —
+`best` is roughly break-even, `fast` roughly 4× quicker than the audio plays.
+Re-measure with `python scripts/benchmark.py --audio <file> --seconds 30
+--device cuda --batch 4` if the hardware changes; batch 4 is what the host runs
+and what these numbers assume.
 
 Mono halves the work. Short clips are disproportionately slow (fixed padding
 overhead). One worker processes one job at a time; everything else queues.

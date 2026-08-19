@@ -108,9 +108,17 @@ scripts/
 
 ## Local development
 
+**Build the venv from Python 3.12**, the version the image uses. torch 2.5.1
+publishes wheels for cp39-cp313 only, so on a host whose default `python3` is
+newer (Ubuntu 26.04 ships 3.14) pip reports `No matching distribution found for
+torch==2.5.1` and offers 2.9+ instead. That is the wheel tags talking, not a
+wrong index URL, and chasing it by bumping torch also means leaving cu124 --
+that index stops at torch 2.6.0. `uv python install 3.12` supplies an
+interpreter without touching the system one.
+
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt --extra-index-url https://download.pytorch.org/whl/cpu
 
 python scripts/fetch_weights.py --variant multi --convert
 docker run -d --name bandit-redis -p 6379:6379 redis:7-alpine
@@ -124,7 +132,7 @@ BANDIT_DATA_DIR=./data BANDIT_REDIS_URL=redis://localhost:6379/0 \
   uvicorn bandit_api.api:app --reload
 ```
 
-Tests:
+Tests (pytest comes from `requirements-dev.txt`, not `requirements.txt`):
 
 ```bash
 pytest tests/ -q            # fast: config + loading

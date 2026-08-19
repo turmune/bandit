@@ -1,0 +1,11 @@
+# Development-only dependencies: everything in requirements.txt, plus the test
+# runner. The Dockerfile installs requirements.txt alone, so pytest and its
+# transitive deps never ship in the image.
+#
+#   pip install -r requirements-dev.txt --extra-index-url https://download.pytorch.org/whl/cpu
+#
+# The index URL is still required -- this pulls in torch via the -r below.
+
+-r requirements.txt
+
+pytest>=8.0

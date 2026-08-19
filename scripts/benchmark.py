@@ -32,6 +32,25 @@ from bandit_api.separator import (  # noqa: E402
 )
 
 
+def default_ckpt() -> Path:
+    """Prefer the converted checkpoint, fall back to the Lightning one.
+
+    ``fetch_weights.py --convert`` deletes the .ckpt it converted unless
+    --keep-original is passed, so on any host that followed the README the
+    Lightning file is simply absent and a default pointing at it fails before
+    the benchmark starts. Both load through the same path -- _strip_state_dict
+    does ``raw.get("state_dict", raw)`` -- so preferring the converted one only
+    changes which file the default finds.
+    """
+    for candidate in (
+        Path("models/checkpoint-multi-inference.pt"),
+        Path("models/checkpoint-multi.ckpt"),
+    ):
+        if candidate.exists():
+            return candidate
+    return Path("models/checkpoint-multi-inference.pt")
+
+
 def peak_rss_gb() -> float:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 / 1024
 
@@ -52,7 +71,7 @@ def make_excerpt(src: Path, seconds: float, dst: Path) -> tuple[Path, float]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--audio", required=True, type=Path)
-    ap.add_argument("--ckpt", default=Path("models/checkpoint-multi.ckpt"), type=Path)
+    ap.add_argument("--ckpt", default=default_ckpt(), type=Path)
     ap.add_argument("--seconds", type=float, default=20.0, help="excerpt length")
     ap.add_argument("--threads", type=int, default=6)
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"],

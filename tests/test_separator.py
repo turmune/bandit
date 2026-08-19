@@ -20,7 +20,22 @@ import soundfile as sf
 from bandit_api.model import SAMPLE_RATE, STEMS, _strip_state_dict, build_bandit
 from bandit_api.separator import QUALITY_PRESETS, SeparationConfig, Separator
 
-CKPT = Path("models/checkpoint-multi.ckpt")
+# The converted checkpoint first: `fetch_weights.py --convert` deletes the
+# Lightning .ckpt unless --keep-original is passed, so pointing only at the
+# latter meant every checkpoint-backed test skipped on a host that followed the
+# README -- and a skip reads the same as a pass in the summary line. Both load
+# through _strip_state_dict, which accepts a bare state_dict or a Lightning one.
+CKPT = next(
+    (
+        p
+        for p in (
+            Path("models/checkpoint-multi-inference.pt"),
+            Path("models/checkpoint-multi.ckpt"),
+        )
+        if p.exists()
+    ),
+    Path("models/checkpoint-multi-inference.pt"),
+)
 requires_ckpt = pytest.mark.skipif(
     not CKPT.exists(), reason="checkpoint absent; run scripts/fetch_weights.py"
 )

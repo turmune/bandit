@@ -25,14 +25,21 @@ log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 
 log "=== boot script started ==="
 
-# Wait for the tailnet address, up to two minutes.
-for _ in $(seq 1 60); do
+# Wait for the tailnet address. tailscaled reaching "active" is not the same as
+# being logged in and addressed -- observed 2026-09-04, where the service was
+# active 3s before dockerd but the address took over two more minutes. Ten
+# minutes rather than two, and the timeout says so: the old loop fell through
+# silently, and the only clue was a log line that never appeared.
+tailscale_ready=no
+for _ in $(seq 1 300); do
   if ip -4 addr show tailscale0 2>/dev/null | grep -q 'inet 100\.'; then
     log "tailscale0 has its address"
+    tailscale_ready=yes
     break
   fi
   sleep 2
 done
+[ "$tailscale_ready" = yes ] || log "WARNING: no tailnet address after 10 min -- continuing, supervisor will retry"
 
 # Wait for dockerd to accept connections, up to a minute.
 for _ in $(seq 1 30); do
@@ -50,20 +57,39 @@ else
 fi
 
 # dockerd restores `restart: unless-stopped` containers at boot, which happens
-# BEFORE this script runs and before tailscale0 has its address. The api
-# container comes back up with its port bindings silently dropped -- running,
-# passing its healthcheck (which curls itself from inside), but publishing
-# nothing. Compose then sees a running container whose config matches and
-# leaves it alone, so waiting for tailscale0 above is necessary but not
-# sufficient. Detect the empty mapping and force a real recreate.
-if [ -z "$(docker port bandit-api-1 2>/dev/null)" ]; then
-  log "api has no published ports -- recreating"
-  docker compose "${COMPOSE[@]}" up -d --force-recreate api >>"$LOG" 2>&1 \
-    && log "api recreated: $(docker port bandit-api-1 | tr '\n' ' ')" \
-    || log "api recreate FAILED"
-else
-  log "api ports ok: $(docker port bandit-api-1 | tr '\n' ' ')"
-fi
+# before this script runs and before tailscale0 has its address. The api
+# container comes back with its port bindings silently dropped -- running,
+# passing its healthcheck (which curls itself from inside, where nothing is
+# wrong), and publishing nothing. Compose then sees a running container whose
+# config matches and leaves it alone.
+#
+# This was a single check-and-repair before, which is why it failed on
+# 2026-09-04: the address was still absent when the one repair ran, the recreate
+# failed, and nothing tried again for three days. It is a supervision loop now.
+# The loop also replaces the bare `sleep infinity` that held the distro open --
+# it never exits, so it does that job too.
+log "supervising api port publishing (60s interval)"
 
-log "holding distro open"
-exec sleep infinity
+last_state=""
+note() {  # log only on change, so a long outage is not a line a minute
+  [ "$1" = "$last_state" ] && return
+  log "$2"
+  last_state="$1"
+}
+
+while true; do
+  if [ -n "$(docker port bandit-api-1 2>/dev/null)" ]; then
+    note ok "api ports ok: $(docker port bandit-api-1 | tr '\n' ' ')"
+  elif ! ip -4 addr show tailscale0 2>/dev/null | grep -q 'inet 100\.'; then
+    note notail "api unpublished and tailscale0 has no address -- waiting for it"
+  else
+    log "api has no published ports -- recreating"
+    if docker compose "${COMPOSE[@]}" up -d --force-recreate api >>"$LOG" 2>&1; then
+      log "api recreated: $(docker port bandit-api-1 | tr '\n' ' ')"
+      last_state=ok
+    else
+      note failed "api recreate FAILED -- retrying every 60s"
+    fi
+  fi
+  sleep 60
+done
